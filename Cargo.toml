@@ -1,0 +1,10 @@
+[package]
+name = "darter-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Flight physics core for the Darter drone simulator"
+
+[dependencies]
+glam = "0.29"
+libc = "0.2"

@@ -1,0 +1,59 @@
+{
+  "role": "primary",
+  "source": {
+    "url": "https://www.ligpower.com/product/v2306_5-v2-fpv-motor.html",
+    "accessed": "2026-09-27",
+    "note": "Manufacturer bench table ('for reference only' per vendor), KV1950 6S section, prop T5143S. Chosen over the iFlight XING2 table because it is the only fetched table with a per-point RPM column, which the plan's one-source rule requires for thrust+rpm+current."
+  },
+  "motor": {
+    "model": "T-HOBBY Velox V2306.5 V2",
+    "kv_rpm_per_v": 1950,
+    "weight_g": 33.2,
+    "idle_current_a_at_10v": 1.28,
+    "internal_resistance_mohm": 67,
+    "max_power_60s_w": 902,
+    "peak_current_a": 37.4,
+    "cells": 6
+  },
+  "prop": { "model": "T-HOBBY T5143S", "diameter_in": 5.1, "pitch_in": 4.3, "blades": 3 },
+  "conditions": {
+    "assumed_air_density_kg_m3": 1.225,
+    "note": "Sea-level standard assumed; bench ambient not published."
+  },
+  "table": [
+    { "throttle": 0.50, "voltage_v": 25.05, "current_a": 7.51,  "thrust_g": 653.80,  "rpm": 20195, "power_w": 188.10 },
+    { "throttle": 0.55, "voltage_v": 25.06, "current_a": 9.80,  "thrust_g": 771.89,  "rpm": 21835, "power_w": 245.42 },
+    { "throttle": 0.60, "voltage_v": 25.01, "current_a": 12.26, "thrust_g": 883.02,  "rpm": 23313, "power_w": 306.48 },
+    { "throttle": 0.65, "voltage_v": 24.95, "current_a": 14.90, "thrust_g": 991.06,  "rpm": 24650, "power_w": 371.83 },
+    { "throttle": 0.70, "voltage_v": 24.90, "current_a": 17.46, "thrust_g": 1090.67, "rpm": 25784, "power_w": 434.67 },
+    { "throttle": 0.75, "voltage_v": 24.84, "current_a": 20.10, "thrust_g": 1182.36, "rpm": 26791, "power_w": 499.21 },
+    { "throttle": 0.80, "voltage_v": 24.78, "current_a": 22.76, "thrust_g": 1263.06, "rpm": 27651, "power_w": 564.03 },
+    { "throttle": 0.85, "voltage_v": 24.71, "current_a": 25.90, "thrust_g": 1362.12, "rpm": 28604, "power_w": 640.16 },
+    { "throttle": 0.90, "voltage_v": 24.65, "current_a": 28.93, "thrust_g": 1444.82, "rpm": 29593, "power_w": 713.22 },
+    { "throttle": 0.95, "voltage_v": 24.58, "current_a": 32.27, "thrust_g": 1518.32, "rpm": 30160, "power_w": 793.20 },
+    { "throttle": 1.00, "voltage_v": 24.51, "current_a": 35.70, "thrust_g": 1591.45, "rpm": 30991, "power_w": 875.15 }
+  ],
+  "other_props_same_motor_6s": {
+    "T4943":  { "t50_thrust_g": 557.63,  "t50_current_a": 5.09,  "t50_rpm": 20559, "t100_thrust_g": 1537.18, "t100_current_a": 35.07, "t100_rpm": 29825 },
+    "T5146":  { "t100_thrust_g": 1699.82, "t100_current_a": 37.43, "t100_rpm": 29557 },
+    "T5147":  { "t100_thrust_g": 1622.65, "t100_current_a": 34.57, "t100_rpm": 30979 }
+  },
+  "advance_ratio_polar_cross_check": {
+    "source": {
+      "url": "https://m-selig.ae.illinois.edu/props/volume-2/data/da4052_5x3.75_3b_1206ga_4025.txt",
+      "index": "https://m-selig.ae.illinois.edu/props/propDB.html",
+      "accessed": "2026-09-27",
+      "note": "UIUC Propeller Database, DA4052 5x3.75 3-blade at fixed tunnel speed: measured CT(J), used only to sanity-check the shape and zero-thrust advance ratio of the axial thrust-falloff law, not fitted from."
+    },
+    "table": [
+      { "j": 0.285636, "ct": 0.116358 },
+      { "j": 0.359163, "ct": 0.101381 },
+      { "j": 0.428136, "ct": 0.086211 },
+      { "j": 0.495309, "ct": 0.069781 },
+      { "j": 0.581879, "ct": 0.048346 },
+      { "j": 0.637874, "ct": 0.032938 },
+      { "j": 0.708222, "ct": 0.014093 },
+      { "j": 0.782841, "ct": -0.006106 }
+    ]
+  }
+}

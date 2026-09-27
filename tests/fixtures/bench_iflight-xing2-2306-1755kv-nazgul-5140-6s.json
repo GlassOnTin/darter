@@ -1,0 +1,29 @@
+{
+  "role": "cross-check",
+  "source": {
+    "url": "https://www.thingbits.in/products/iflight-xing2-2306-unibell-fpv-brushless-motor",
+    "accessed": "2026-09-27",
+    "note": "Manufacturer bench table. No RPM column, so it cannot carry the one-source calibration; used only as an independent max-thrust/current cross-check on a different motor+prop (Nazgul 5140)."
+  },
+  "motor": {
+    "model": "iFlight XING2 2306",
+    "kv_rpm_per_v": 1755,
+    "max_power_spec_w": 869
+  },
+  "prop": { "model": "Gemfan Nazgul 5140", "diameter_in": 5.0, "pitch_in": 4.0, "blades": 3 },
+  "conditions": {
+    "assumed_air_density_kg_m3": 1.225,
+    "note": "Sea-level standard assumed; bench ambient not published."
+  },
+  "table": [
+    { "throttle": 0.50, "voltage_v": null, "current_a": 8.85,  "thrust_g": 626.0 },
+    { "throttle": 0.60, "voltage_v": null, "current_a": 13.31, "thrust_g": 823.0 },
+    { "throttle": 0.70, "voltage_v": null, "current_a": 19.46, "thrust_g": 957.0 },
+    { "throttle": 0.80, "voltage_v": null, "current_a": 25.26, "thrust_g": 1128.0 },
+    { "throttle": 0.90, "voltage_v": null, "current_a": 31.32, "thrust_g": 1265.0 },
+    { "throttle": 1.00, "voltage_v": null, "current_a": 34.85, "thrust_g": 1415.0 }
+  ],
+  "other_props_same_motor_6s": {
+    "GEMFAN_51466": { "t100_thrust_g": 1651.0, "t100_current_a": 36.21 }
+  }
+}
