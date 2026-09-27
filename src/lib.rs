@@ -7,9 +7,12 @@
 
 pub mod air;
 pub mod battery;
+pub mod msp;
 pub mod preset;
 pub mod quad;
 pub mod radio;
+pub mod record;
+pub mod sha256;
 pub mod sitl;
 
 pub use glam::{DQuat, DVec3};
