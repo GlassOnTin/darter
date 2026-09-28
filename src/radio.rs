@@ -142,7 +142,13 @@ pub fn axis_count(path: &str) -> io::Result<u8> {
     let f = File::open(path)?;
     let mut buf = [0u8; 1];
     // SAFETY: JSIOCGAXES ioctl writes one byte into buf.
-    let r = unsafe { libc::ioctl(f.as_raw_fd(), JSIOCGAXES as libc::c_ulong, &mut buf) };
+    // glibc's ioctl takes an unsigned long request; bionic/musl take int
+    // (the 32-bit pattern is what the kernel reads either way).
+    #[cfg(target_env = "gnu")]
+    let req = JSIOCGAXES as libc::c_ulong;
+    #[cfg(not(target_env = "gnu"))]
+    let req = JSIOCGAXES as libc::c_int;
+    let r = unsafe { libc::ioctl(f.as_raw_fd(), req, &mut buf) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
