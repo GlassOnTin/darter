@@ -1,0 +1,20 @@
+; T5 smoke-test project: a minimal camera-follow replay scene driven by a
+; darter flight record (env DARTER_RECORD). Rendered by tests/godot.rs via
+; Movie Maker mode (--write-movie --fixed-fps); see replay.gd.
+
+config_version=5
+
+[application]
+
+config/name="darter-replay-smoke"
+run/main_scene="res://replay.tscn"
+config/features=PackedStringArray("4.7")
+
+[display]
+
+window/size/viewport_width=640
+window/size/viewport_height=360
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
