@@ -91,6 +91,18 @@ struct Args {
     core_throttle: Option<f64>,
     /// Core-mode spawn altitude in m (default 0.5 m, just off the ground).
     alt: f64,
+    /// Core-mode spawn offsets in m (default 0): x east, y north, relative
+    /// to the origin. Lets a scripted core flight start inside an area pack
+    /// (the record frame is the same ENU frame the packs use).
+    x: f64,
+    y: f64,
+    /// Core-mode initial velocity in m/s (default zero): with hover throttle
+    /// the quad coasts level while drag bleeds the speed off (~1% / s for
+    /// the calibrated 5" drag), which is the honest physics of a level
+    /// transit — no attitude controller exists in core mode.
+    vx: f64,
+    vy: f64,
+    vz: f64,
     sensors: bool,
     sensor_cfg: Option<SensorConfig>,
     wind_cfg: Option<WindConfig>,
@@ -124,6 +136,11 @@ fn parse_args() -> Result<Args, String> {
         throttle: DEFAULT_THROTTLE,
         core_throttle: None,
         alt: 0.5,
+        x: 0.0,
+        y: 0.0,
+        vx: 0.0,
+        vy: 0.0,
+        vz: 0.0,
         sensors: false,
         sensor_cfg: None,
         wind_cfg: None,
@@ -171,6 +188,11 @@ fn parse_args() -> Result<Args, String> {
                 a.core_throttle = Some(a.throttle);
             }
             "--alt" => a.alt = val("alt")?.parse().map_err(|_| "--alt wants metres")?,
+            "--x" => a.x = val("x")?.parse().map_err(|_| "--x wants metres")?,
+            "--y" => a.y = val("y")?.parse().map_err(|_| "--y wants metres")?,
+            "--vx" => a.vx = val("vx")?.parse().map_err(|_| "--vx wants m/s")?,
+            "--vy" => a.vy = val("vy")?.parse().map_err(|_| "--vy wants m/s")?,
+            "--vz" => a.vz = val("vz")?.parse().map_err(|_| "--vz wants m/s")?,
             "--determinism-check" => a.determinism_check = true,
             "--gps-stale" => a.gps_stale = true,
             s if s == "--wind" || s.starts_with("--wind=") => {
@@ -247,6 +269,10 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.determinism_check && a.mode != "core" {
         return Err("--determinism-check is core-only (closed loops are not bit-reproducible)".into());
+    }
+    let scripted_spawn = a.x != 0.0 || a.y != 0.0 || a.vx != 0.0 || a.vy != 0.0 || a.vz != 0.0;
+    if scripted_spawn && a.mode != "core" {
+        return Err("--x/--y/--vx/--vy/--vz are core-only (closed mode is flown by the FC)".into());
     }
     Ok(a)
 }
@@ -340,8 +366,12 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
         .core_throttle
         .unwrap_or_else(|| hover_throttle(&preset, preset.battery, 1.0, RHO_0));
     println!("[sim_run] core mode: throttle {:.4}, {} s", thr, duration);
-    let mut quad = Quad::new(preset, DVec3::new(0.0, 0.0, args.alt));
+    let mut quad = Quad::new(preset, DVec3::new(args.x, args.y, args.alt));
     quad.throttle = [thr; 4];
+    // Scripted initial velocity (level transit; see the --vx doc comment).
+    if args.vx != 0.0 || args.vy != 0.0 || args.vz != 0.0 {
+        quad.state.vel = DVec3::new(args.vx, args.vy, args.vz);
+    }
     let mut wind = args.wind_cfg.map(WindModel::new);
     if let Some(cfg) = &wind {
         quad.wind = cfg.config().mean;
@@ -355,7 +385,17 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
             seed: args.seed,
             duration_s: duration,
             preset: preset.name,
-            profile: vec![format!("throttle={thr:.6}"), format!("alt={:.3}", args.alt)],
+            profile: {
+                let mut p = vec![
+                    format!("throttle={thr:.6}"),
+                    format!("alt={:.3}", args.alt),
+                    format!("spawn=({:.3},{:.3})", args.x, args.y),
+                ];
+                if args.vx != 0.0 || args.vy != 0.0 || args.vz != 0.0 {
+                    p.push(format!("vel=({:.3},{:.3},{:.3})", args.vx, args.vy, args.vz));
+                }
+                p
+            },
             sitl: None,
             sensors: None,
             wind: args.wind_cfg,
