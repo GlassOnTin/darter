@@ -1,3 +1,4 @@
 /target
 *.swp
 /tools/godot/
+__pycache__/
