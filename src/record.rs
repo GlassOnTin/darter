@@ -9,19 +9,21 @@
 //!
 //! Line schemas (field order is the wire contract; appending fields is a
 //! version bump, reordering is a new schema):
-//!   header: {"schema":"darter_record","version":3,"mode":..,"seed":..,
+//!   header: {"schema":"darter_record","version":4,"mode":..,"seed":..,
 //!            "duration_s":..,"preset":..,"profile":[..],
-//!            "sensors":{..}|null,"sitl":{..}|null}
-//!     (v2 added sensors provenance, v3 added the g*/alt/vario FC fields)
+//!            "sensors":{..}|null,"wind":{..}|null,"sitl":{..}|null}
+//!     (v2 added sensors provenance, v3 added the g*/alt/vario FC fields,
+//!      v4 added the wind config + per-sample wind fields)
 //!   sample: {"t":..,"px":..,"py":..,"pz":..,"vx":..,"vy":..,"vz":..,
 //!            "qw":..,"qx":..,"qy":..,"qz":..,"wx":..,"wy":..,"wz":..,
 //!            "r0":..,"r1":..,"r2":..,"r3":..,"i0":..,"i1":..,"i2":..,"i3":..,
-//!            "vbus":..,"soc":..,
+//!            "vbus":..,"soc":..,"windx":..,"windy":..,"windz":..,
 //!            "att_r":..,"att_p":..,"att_y":..,"m0":..,"m1":..,"m2":..,"m3":..,
 //!            "g0":..,"g1":..,"g2":..,"alt":..,"vario":..,"arm":..,"flags":..}
-//! The FC telemetry fields (att_*, m*, g*, alt, vario, arm, flags) are omitted
-//! when no telemetry was sampled for that tick; the core fields are always
-//! present.
+//! The FC telemetry fields (att_*, m*, g*, alt, vario, arm, flags) and the
+//! wind fields (windx/windy/windz, ENU m/s, the total fed into Quad::wind
+//! that tick) are omitted when no telemetry/wind was sampled for that tick;
+//! the core fields are always present.
 //!
 //! FC field units (all measured against the SITL build pinned in the header):
 //! - att_r/att_p: MSP 108 roll/pitch in DECIDEGREES (imu.c writes 1800/pi
@@ -39,7 +41,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 pub const SCHEMA_NAME: &str = "darter_record";
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// FNV-1a 64-bit (offset 14695981039346656037, prime 1099511628211).
 pub fn fnv1a64(data: &[u8], mut hash: u64) -> u64 {
@@ -67,6 +69,8 @@ pub struct RecordHeader {
     pub sitl: Option<SitlProvenance>,
     /// Sensor model provenance (None = noise off, pure rigid-body truth).
     pub sensors: Option<crate::sensor::SensorConfig>,
+    /// Wind model provenance (None = still air, Quad::wind stays zero).
+    pub wind: Option<crate::wind::WindConfig>,
 }
 
 /// One sampled tick. FC telemetry is optional (None in core-only runs and
@@ -81,6 +85,10 @@ pub struct Sample {
     pub i_mot: [f64; 4],
     pub vbus: f64,
     pub soc: f64,
+    /// Total wind fed into Quad::wind this tick (mean + gust), ENU m/s.
+    /// None = still air (field omitted, keeps wind-off records byte-identical
+    /// to the pre-wind schema's no-fc rows).
+    pub wind: Option<crate::DVec3>,
     pub fc: Option<FcSample>,
 }
 
@@ -128,7 +136,7 @@ impl RecordWriter {
 
     pub fn write_header(&mut self, h: &RecordHeader) -> io::Result<()> {
         let mut s = String::with_capacity(256);
-        s.push_str("{");
+        s.push('{');
         s.push_str(&format!("\"schema\":\"{SCHEMA_NAME}\",\"version\":{SCHEMA_VERSION}"));
         s.push_str(&format!(",\"mode\":\"{}\"", h.mode));
         s.push_str(&format!(",\"seed\":{}", h.seed));
@@ -152,6 +160,15 @@ impl RecordWriter {
                 ));
             }
             None => s.push_str(",\"sensors\":null"),
+        }
+        match &h.wind {
+            Some(w) => {
+                s.push_str(&format!(
+                    ",\"wind\":{{\"mean_x\":{:.3},\"mean_y\":{:.3},\"mean_z\":{:.3},\"w20_ms\":{:.3},\"seed\":{}}}",
+                    w.mean.x, w.mean.y, w.mean.z, w.w20_ms, w.seed
+                ));
+            }
+            None => s.push_str(",\"wind\":null"),
         }
         match &h.sitl {
             Some(p) => {
@@ -181,6 +198,12 @@ impl RecordWriter {
             s.i_mot[0], s.i_mot[1], s.i_mot[2], s.i_mot[3],
             s.vbus, s.soc,
         ));
+        if let Some(w) = &s.wind {
+            b.push_str(&format!(
+                ",\"windx\":{:.3},\"windy\":{:.3},\"windz\":{:.3}",
+                w.x, w.y, w.z
+            ));
+        }
         if let Some(fc) = &s.fc {
             b.push_str(&format!(
                 ",\"att_r\":{},\"att_p\":{},\"att_y\":{},\"m0\":{:.4},\"m1\":{:.4},\"m2\":{:.4},\"m3\":{:.4},\"g0\":{:.1},\"g1\":{:.1},\"g2\":{:.1},\"alt\":{},\"vario\":{},\"arm\":{},\"flags\":{}",
@@ -233,6 +256,7 @@ mod tests {
             i_mot: [1.5; 4],
             vbus: 25.08,
             soc: 1.0,
+            wind: None,
             fc: None,
         }
     }
@@ -252,6 +276,7 @@ mod tests {
             profile: vec!["aux 0 0 2 1700 2100 0 0".into()],
             sitl: None,
             sensors: None,
+            wind: None,
         })
         .unwrap();
         w.write_sample(&sample(0.0, 0.5)).unwrap();
@@ -261,13 +286,44 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
         let header = lines.next().unwrap();
-        assert!(header.starts_with("{\"schema\":\"darter_record\",\"version\":3,\"mode\":\"core\",\"seed\":7,\"duration_s\":2.000,\"preset\":\"FREESTYLE_5IN\",\"profile\":[\"aux 0 0 2 1700 2100 0 0\"],\"sensors\":null,\"sitl\":null}"));
+        assert!(header.starts_with("{\"schema\":\"darter_record\",\"version\":4,\"mode\":\"core\",\"seed\":7,\"duration_s\":2.000,\"preset\":\"FREESTYLE_5IN\",\"profile\":[\"aux 0 0 2 1700 2100 0 0\"],\"sensors\":null,\"wind\":null,\"sitl\":null}"));
         let s0 = lines.next().unwrap();
         assert!(
             s0.starts_with("{\"t\":0.000,\"px\":1.000000,\"py\":2.000000,\"pz\":0.500000,"),
             "first fields not in contract order: {s0}"
         );
         assert!(s0.ends_with("\"vbus\":25.0800,\"soc\":1.000000}"), "no fc fields: {s0}");
+        // Wind provenance in the header and wind fields after soc, before any
+        // fc fields.
+        let mut w = RecordWriter::create(&path).unwrap();
+        w.write_header(&RecordHeader {
+            mode: "core",
+            seed: 7,
+            duration_s: 2.0,
+            preset: "FREESTYLE_5IN",
+            profile: vec![],
+            sitl: None,
+            sensors: None,
+            wind: Some(crate::wind::WindConfig {
+                mean: crate::DVec3::new(1.5, -2.0, 0.0),
+                w20_ms: 15.43,
+                seed: 9,
+            }),
+        })
+        .unwrap();
+        let mut sw = sample(0.0, 0.5);
+        sw.wind = Some(crate::DVec3::new(1.2, -2.1, 0.0));
+        w.write_sample(&sw).unwrap();
+        let _ = w.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        assert!(header.contains("\"wind\":{\"mean_x\":1.500,\"mean_y\":-2.000,\"mean_z\":0.000,\"w20_ms\":15.430,\"seed\":9}"), "{header}");
+        let s0 = lines.next().unwrap();
+        assert!(
+            s0.contains("\"vbus\":25.0800,\"soc\":1.000000,\"windx\":1.200,\"windy\":-2.100,\"windz\":0.000}"),
+            "wind fields after soc: {s0}"
+        );
         let hash2 = {
             let mut w = RecordWriter::create(&path).unwrap();
             w.write_header(&RecordHeader {
@@ -278,6 +334,7 @@ mod tests {
                 profile: vec!["aux 0 0 2 1700 2100 0 0".into()],
                 sitl: None,
                 sensors: None,
+                wind: None,
             })
             .unwrap();
             w.write_sample(&sample(0.0, 0.5)).unwrap();

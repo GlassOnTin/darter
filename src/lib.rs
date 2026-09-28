@@ -8,6 +8,7 @@
 pub mod air;
 pub mod battery;
 pub mod msp;
+pub mod rng;
 pub mod preset;
 pub mod quad;
 pub mod radio;
@@ -15,5 +16,6 @@ pub mod record;
 pub mod sensor;
 pub mod sha256;
 pub mod sitl;
+pub mod wind;
 
 pub use glam::{DQuat, DVec3};

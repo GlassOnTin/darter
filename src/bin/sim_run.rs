@@ -48,6 +48,7 @@ use darter_core::record::{FcSample, RecordHeader, RecordWriter, Sample, SitlProv
 use darter_core::sha256::sha256_hex;
 use darter_core::sensor::{SensorConfig, SensorModel};
 use darter_core::sitl::{fdm_from_state, fdm_from_state_imu, rc_packet, SimLink};
+use darter_core::wind::{WindConfig, WindModel};
 use darter_core::DVec3;
 
 const SUBSTEP_DT: f64 = 125e-6; // 8 kHz core step
@@ -84,8 +85,15 @@ struct Args {
     determinism_check: bool,
     bin: String,
     throttle: f64,
+    /// Core-mode throttle override: Some means `--throttle` was given, so
+    /// core mode scripts that value instead of the solved hover throttle
+    /// (0 = motors-off tests).
+    core_throttle: Option<f64>,
+    /// Core-mode spawn altitude in m (default 0.5 m, just off the ground).
+    alt: f64,
     sensors: bool,
     sensor_cfg: Option<SensorConfig>,
+    wind_cfg: Option<WindConfig>,
     /// Yaw stick value (Fly phase), for yaw-axis stability probes.
     yaw: f64,
     /// Sim time after which the yaw stick returns to zero.
@@ -114,8 +122,11 @@ fn parse_args() -> Result<Args, String> {
         determinism_check: false,
         bin: DEFAULT_BIN.into(),
         throttle: DEFAULT_THROTTLE,
+        core_throttle: None,
+        alt: 0.5,
         sensors: false,
         sensor_cfg: None,
+        wind_cfg: None,
         yaw: 0.0,
         yaw_until: f64::INFINITY,
         pitch: 0.0,
@@ -127,6 +138,8 @@ fn parse_args() -> Result<Args, String> {
     // Set when the --sensors spec pinned a seed, so a bare --sensors follows
     // the run seed (same --seed reproduces the same noise stream).
     let mut sensor_seed_given = false;
+    // Same convention for --wind.
+    let mut wind_seed_given = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = |name: &str| -> Result<String, String> {
@@ -154,10 +167,39 @@ fn parse_args() -> Result<Args, String> {
                 a.roll_until = val("roll-until")?.parse().map_err(|_| "--roll-until wants seconds")?
             }
             "--throttle" => {
-                a.throttle = val("throttle")?.parse().map_err(|_| "--throttle wants 0..1")?
+                a.throttle = val("throttle")?.parse().map_err(|_| "--throttle wants 0..1")?;
+                a.core_throttle = Some(a.throttle);
             }
+            "--alt" => a.alt = val("alt")?.parse().map_err(|_| "--alt wants metres")?,
             "--determinism-check" => a.determinism_check = true,
             "--gps-stale" => a.gps_stale = true,
+            s if s == "--wind" || s.starts_with("--wind=") => {
+                // Bare --wind: standard weather (mean calm, W20 moderate).
+                let mut cfg = WindConfig {
+                    mean: DVec3::ZERO,
+                    w20_ms: 15.43,
+                    seed: 1,
+                };
+                if let Some(spec) = arg.strip_prefix("--wind=") {
+                    for kv in spec.split(',') {
+                        let (k, v) = kv.split_once('=')
+                            .ok_or_else(|| format!("--wind spec wants key=value, got {kv}"))?;
+                        match k {
+                            "ex" => cfg.mean.x = v.parse().map_err(|_| format!("--wind {k} wants f64"))?,
+                            "ny" => cfg.mean.y = v.parse().map_err(|_| format!("--wind {k} wants f64"))?,
+                            "uz" => cfg.mean.z = v.parse().map_err(|_| format!("--wind {k} wants f64"))?,
+                            "w20" => cfg.w20_ms = v.parse().map_err(|_| format!("--wind {k} wants f64"))?,
+                            "seed" => {
+                                cfg.seed = v.parse().map_err(|_| "--wind seed wants u64")?;
+                                wind_seed_given = true;
+                                continue;
+                            }
+                            other => return Err(format!("--wind unknown key {other}")),
+                        }
+                    }
+                }
+                a.wind_cfg = Some(cfg);
+            }
             s if s == "--sensors" || s.starts_with("--sensors=") => {
                 a.sensors = true;
                 let mut cfg = a.sensor_cfg.unwrap_or(SensorConfig::DEFAULT);
@@ -192,6 +234,11 @@ fn parse_args() -> Result<Args, String> {
     // the same --seed reproduces the same noise stream (recorded inputs).
     if let Some(cfg) = &mut a.sensor_cfg {
         if !sensor_seed_given {
+            cfg.seed = a.seed;
+        }
+    }
+    if let Some(cfg) = &mut a.wind_cfg {
+        if !wind_seed_given {
             cfg.seed = a.seed;
         }
     }
@@ -233,6 +280,7 @@ struct RunOutcome {
     servo_packets: u64,
     msp_errors: u64,
     sensors: bool,
+    wind: bool,
     sitl: Option<SitlInfo>,
 }
 
@@ -279,18 +327,25 @@ fn main() {
     }
 }
 
-/// Core-mode flight: scripted throttle (the solved hover value), no SITL,
-/// record every tick. Identical inputs produce identical record hashes.
+/// Core-mode flight: scripted throttle (the solved hover value, or
+/// `--throttle` when given — 0 = motors-off tests), no SITL, record every
+/// tick. Identical inputs produce identical record hashes.
 fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
     let duration = args.duration.unwrap_or(2.0);
     let out_dir = PathBuf::from(&args.out);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("out dir: {e}"))?;
 
     let preset = Preset::FREESTYLE_5IN;
-    let thr = hover_throttle(&preset, preset.battery, 1.0, RHO_0);
-    println!("[sim_run] core mode: hover throttle {:.4}, {} s", thr, duration);
-    let mut quad = Quad::new(preset, DVec3::new(0.0, 0.0, 0.5));
+    let thr = args
+        .core_throttle
+        .unwrap_or_else(|| hover_throttle(&preset, preset.battery, 1.0, RHO_0));
+    println!("[sim_run] core mode: throttle {:.4}, {} s", thr, duration);
+    let mut quad = Quad::new(preset, DVec3::new(0.0, 0.0, args.alt));
     quad.throttle = [thr; 4];
+    let mut wind = args.wind_cfg.map(WindModel::new);
+    if let Some(cfg) = &wind {
+        quad.wind = cfg.config().mean;
+    }
 
     let mut record = RecordWriter::create(&out_dir.join(record_name))
         .map_err(|e| format!("record: {e}"))?;
@@ -300,9 +355,10 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
             seed: args.seed,
             duration_s: duration,
             preset: preset.name,
-            profile: vec![format!("hover_throttle={thr:.6}")],
+            profile: vec![format!("throttle={thr:.6}"), format!("alt={:.3}", args.alt)],
             sitl: None,
             sensors: None,
+            wind: args.wind_cfg,
         })
         .map_err(|e| format!("record header: {e}"))?;
 
@@ -312,12 +368,18 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
     let mut max_alt = 0.0f64;
     for tick in 0..total_ticks {
         let tick_start = Instant::now();
+        // Wind advances once per tick at the current altitude, then holds
+        // across the 32 substeps (the gust filter runs at tick rate).
+        if let Some(w) = wind.as_mut() {
+            quad.wind = w.step(TICK_DT, quad.state.pos.z);
+        }
         for _ in 0..SUBSTEPS_PER_TICK {
             quad.step(SUBSTEP_DT);
         }
         let t = (tick + 1) as f64 * TICK_DT;
         // No sensor model yet (T3): the quad state is the telemetry, no FC.
-        write_sample(&mut record, t, &quad, None).map_err(|e| format!("record: {e}"))?;
+        write_sample(&mut record, t, &quad, wind.is_some().then_some(quad.wind), None)
+            .map_err(|e| format!("record: {e}"))?;
         max_alt = max_alt.max(quad.state.pos.z);
         loop_ms.push(tick_start.elapsed().as_secs_f64() * 1e3);
     }
@@ -344,11 +406,18 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
         servo_packets: 0,
         msp_errors: 0,
         sensors: false,
+        wind: args.wind_cfg.is_some(),
         sitl: None,
     })
 }
 
-fn write_sample(w: &mut RecordWriter, t: f64, quad: &Quad, fc: Option<FcSample>) -> io::Result<()> {
+fn write_sample(
+    w: &mut RecordWriter,
+    t: f64,
+    quad: &Quad,
+    wind: Option<DVec3>,
+    fc: Option<FcSample>,
+) -> io::Result<()> {
     w.write_sample(&Sample {
         t,
         pos: quad.state.pos,
@@ -359,6 +428,7 @@ fn write_sample(w: &mut RecordWriter, t: f64, quad: &Quad, fc: Option<FcSample>)
         i_mot: quad.i_mot,
         vbus: quad.bus_voltage(),
         soc: quad.soc(),
+        wind,
         fc,
     })
 }
@@ -581,6 +651,7 @@ fn fly_closed(
                 version: sitl_info.version.clone(),
             }),
             sensors: args.sensor_cfg.clone(),
+            wind: args.wind_cfg,
         })
         .map_err(|e| format!("record header: {e}"))?;
 
@@ -619,6 +690,7 @@ fn fly_closed(
             servo_packets: lo.servo_packets,
             msp_errors,
             sensors: args.sensors,
+            wind: args.wind_cfg.is_some(),
             sitl: Some(sitl_info),
         }
     })
@@ -664,10 +736,19 @@ fn fly_loop(
     // Sensor model seeded from the run seed; None keeps the fdm path
     // bit-identical to the pre-sensor harness.
     let mut sensor = args.sensor_cfg.as_ref().map(|c| SensorModel::new(*c));
+    // Wind advances once per tick; None keeps the physics path bit-identical
+    // to the pre-wind harness (Quad::wind stays zero).
+    let mut wind = args.wind_cfg.map(WindModel::new);
+    if let Some(cfg) = &wind {
+        quad.wind = cfg.config().mean;
+    }
 
     for tick in 0..total_ticks {
         let tick_start = Instant::now();
         let t = (tick + 1) as f64 * TICK_DT;
+        if let Some(w) = wind.as_mut() {
+            quad.wind = w.step(TICK_DT, quad.state.pos.z);
+        }
 
         // Latest FC status drives the arming state machine.
         let (arm, flags) = {
@@ -761,7 +842,8 @@ fn fly_loop(
             }
         };
 
-        write_sample(&mut record, t, &quad, fc).map_err(|e| format!("record: {e}"))?;
+        write_sample(&mut record, t, &quad, wind.is_some().then_some(quad.wind), fc)
+            .map_err(|e| format!("record: {e}"))?;
         max_alt = max_alt.max(quad.state.pos.z);
 
         // Wall-clock pacing: sleep off what is left of this 4 ms tick.
@@ -878,6 +960,7 @@ fn write_summary(out_dir: &Path, args: &Args, o: &RunOutcome) -> Result<(), Stri
     s.push_str(&format!("    \"max\": {:.3}\n", o.loop_max_ms));
     s.push_str("  },\n");
     s.push_str(&format!("  \"sensors\": {},\n", o.sensors));
+    s.push_str(&format!("  \"wind\": {},\n", o.wind));
     s.push_str(&format!("  \"att_samples\": {},\n", o.att_samples));
     match o.armed_at_s {
         Some(t) => s.push_str(&format!("  \"armed_at_s\": {:.3},\n", t)),
