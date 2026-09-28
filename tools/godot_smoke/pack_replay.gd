@@ -362,7 +362,15 @@ func _build_world() -> void:
 	var sun := DirectionalLight3D.new()
 	sun.rotation_degrees = Vector3(-50.0, 35.0, 0.0)
 	sun.shadow_enabled = true
-	sun.directional_shadow_max_distance = 400.0
+	# The compatibility renderer's default PSSM-4 over max_distance renders
+	# the whole scene 5x per frame (4 shadow passes + main; measured 510k
+	# prims at this pack size). Two splits over 200 m render it 3x (306k) —
+	# a 40% GPU-work cut for battery/thermal — with the near-field shadows
+	# and the grid pixel classes unchanged on the Adreno 830. The scene
+	# holds vsync-locked 60 fps either way (8x-copy probe), so this is a
+	# work cut, not a throughput unlock.
+	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS
+	sun.directional_shadow_max_distance = 200.0
 	add_child(sun)
 
 
