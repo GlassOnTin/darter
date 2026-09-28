@@ -19,9 +19,11 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 pub const MSP_STATUS: u16 = 101;
+pub const MSP_RAW_IMU: u16 = 102;
 pub const MSP_MOTOR: u16 = 104;
 pub const MSP_RC: u16 = 105;
 pub const MSP_ATTITUDE: u16 = 108;
+pub const MSP_ALTITUDE: u16 = 109;
 pub const MSP_STATUS_EX: u16 = 150;
 pub const MSP2_CLI_COMMAND: u16 = 0x3012;
 
@@ -258,12 +260,38 @@ pub fn parse_reply(buf: &[u8]) -> Option<Result<(u8, Frame, usize), MspError>> {
     Some(Ok((dialect, Frame { cmd, flags, payload }, total)))
 }
 
-/// Attitude from MSP 108: euler angles in centidegrees.
+/// MSP 108 payload. The FC's OWN Mahony estimate, not the fed truth: this
+/// SITL build compiles USE_IMU_CALC (common_pre.h), so the direct attitude
+/// feed is out and the estimator runs against the virtual gyro/acc/mag.
+/// Measured behaviour (2026-09-28 closed-loop records + open-loop probes,
+/// /tmp/ahrs-probe-{tilt30,yaw90}, /tmp/darter-run-{tilt2,yaw2}):
+/// - roll/pitch: accelerometer-belief dominated. Near level the estimate
+///   tracks truth within ~2 deg, but under sustained tilt the acc correction
+///   (only valid near 1 g, imuIsAccelerometerHealthy) drags the estimate
+///   toward level at ~1.4 deg/s — a 10 deg held tilt decays to <2 deg on the
+///   estimate (tilt2: truth +9.9 deg held, estimate peak +7.5 -> +1.5).
+/// - yaw: gyro-integrated heading, no mag fusion (compassEnabledAndCalibrated
+///   requires a calibration run that never happens in the harness, imu.c).
+///   Tracks the truth heading at zero groundspeed to within ~15 deg (probe B
+///   and yaw2/tilt2: att_y = -truth_yaw + near-constant lag, mean +1.4 to
+///   +7.3 deg, |max| 14.4). Above 1 m/s
+///   groundspeed the GPS COG anchor fires once (imu.c GPS_COG_MIN_GROUNDSPEED
+///   100 -> imuComputeQuaternionFromRPY) and the ongoing cogErr term drags
+///   heading toward drift course; the anchor also re-references the heading
+///   from the estimator's own 0 to the compass COG, so the displayed value
+///   jumps by the reference mismatch with no physical yaw change (tilt2:
+///   0 -> 89 with the craft facing east the whole time). At 25 Hz telemetry
+///   the estimate aliases fast truth oscillations (the ~4.3 Hz closed-loop
+///   yaw limit cycle, tests/sitl_loop.rs): per-interval yaw RATE agreement is
+///   not meaningful in that regime; the heading-angle offset above is.
+/// Units (imu.c imuUpdateEulerAngles writes roll/pitch at 1800/pi = 0.1 deg
+/// steps; msp.c passes yaw through DECIDEGREES_TO_DEGREES):
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Attitude {
-    pub roll_cdeg: i16,
-    pub pitch_cdeg: i16,
-    pub yaw_cdeg: i16,
+    pub roll_decdeg: i16,
+    pub pitch_decdeg: i16,
+    /// Degrees, wrapped to 0..360 (not decidegrees despite the u16 wire size).
+    pub yaw_deg: i16,
 }
 
 /// MSP 108 payload (3 x i16 LE).
@@ -272,14 +300,81 @@ pub fn decode_attitude(p: &[u8]) -> Option<Attitude> {
         return None;
     }
     Some(Attitude {
-        roll_cdeg: i16::from_le_bytes([p[0], p[1]]),
-        pitch_cdeg: i16::from_le_bytes([p[2], p[3]]),
-        yaw_cdeg: i16::from_le_bytes([p[4], p[5]]),
+        roll_decdeg: i16::from_le_bytes([p[0], p[1]]),
+        pitch_decdeg: i16::from_le_bytes([p[2], p[3]]),
+        yaw_deg: i16::from_le_bytes([p[4], p[5]]),
+    })
+}
+
+/// MSP 109 (ALTITUDE) payload: the fused altitude estimate, int32 LE cm, plus
+/// the vario, int16 LE cm/s (msp.c `case MSP_ALTITUDE`: getEstimatedAltitudeCm,
+/// getEstimatedVario). This is the position estimator's KF output (flight/
+/// position_estimator.c) — baro + inertial-Z + (when GPS fixes) GPS altitude,
+/// pt2-smoothed for display (position.c altitudeLpf) — the instrument for the
+/// altitude-drift diagnosis below.
+///
+/// Altitude-drift diagnosis (T3, measured against the pinned SITL binary,
+/// closed-loop full-throttle climbs unless noted; truth = record z):
+/// - The estimate tracks truth with a bounded lag proportional to climb rate,
+///   not a bias and not drift: mean error −0.07 m at 0.92 m/s climb (hover),
+///   −2.9 m at 30.1 m/s ⇒ ≈0.08–0.1 s of pipeline lag. Error is flat over the
+///   flight (early ≈ late); no integrator runaway.
+/// - Insensitive to `altitude_prefer_baro` 10/50/100: −3.22/−2.89/−2.70 m.
+///   Baro trust is not the source (10× noise inflation moves it 0.5 m).
+/// - Insensitive to GPS loss (`--gps-stale` sentinel): −2.53 m.
+/// - The pre-T1 observation of −13→−117 m runaway was measured under the
+///   uncalibrated physics (60+ m/s climbs, vertical drag ~5× low) and does
+///   not reproduce after T1 calibration.
+/// - Input side verified end to end: sitl.c derives baro pressure from the
+///   true altitude via ISA (sitl.c:314–319); the FC inverts with
+///   pressureToAltitude (barometer.c:438–441); round-trip error 0.005 %.
+/// - Residual cause: upstream KF + display-filter dynamic lag. Documented,
+///   unfixed (a sim-side patch masking it would be worse than the bug).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EstimatedAltitude {
+    /// Relative altitude, cm (KF state, pt2-smoothed for display).
+    pub alt_cm: i32,
+    /// Vertical speed, cm/s (0 when USE_VARIO is compiled out).
+    pub vario_cms: i16,
+}
+
+pub fn decode_estimated_altitude(p: &[u8]) -> Option<EstimatedAltitude> {
+    if p.len() < 6 {
+        return None;
+    }
+    Some(EstimatedAltitude {
+        alt_cm: i32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+        vario_cms: i16::from_le_bytes([p[4], p[5]]),
     })
 }
 
 fn decode_u16_vec(p: &[u8], count: usize) -> Vec<u16> {
     p.chunks_exact(2).take(count).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+}
+
+/// MSP 102 (RAW_IMU) payload: acc counts, gyro counts, mag counts (msp.c
+/// `case MSP_RAW_IMU`). The gyro triplet comes from
+/// `gyroRateDps(i) = lrintf(gyroADCf / rawSensorDev->scale)` (gyro_init.c) —
+/// the FILTERED signal the PID loop sees, expressed in raw-count units
+/// (gyroADCf is dps; scale is 16.4 lsb/dps for a 2000 dps-range gyro).
+/// Multiply by 0.061035 to get dps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawImu {
+    pub acc: [i16; 3],
+    pub gyro_raw: [i16; 3],
+    pub mag: [i16; 3],
+}
+
+pub fn decode_raw_imu(p: &[u8]) -> Option<RawImu> {
+    if p.len() < 18 {
+        return None;
+    }
+    let g = |o: usize| i16::from_le_bytes([p[o], p[o + 1]]);
+    Some(RawImu {
+        acc: [g(0), g(2), g(4)],
+        gyro_raw: [g(6), g(8), g(10)],
+        mag: [g(12), g(14), g(16)],
+    })
 }
 
 /// MSP 104 payload: up to 8 motor values (u16 LE).

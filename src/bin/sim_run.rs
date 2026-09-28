@@ -39,13 +39,15 @@ use std::time::{Duration, Instant};
 
 use darter_core::air::RHO_0;
 use darter_core::msp::{
-    decode_attitude, decode_motor, decode_status, MspLink, MSP_ATTITUDE, MSP_MOTOR, MSP_STATUS,
+    decode_attitude, decode_estimated_altitude, decode_motor, decode_raw_imu, decode_status,
+    MspLink, MSP_ALTITUDE, MSP_ATTITUDE, MSP_MOTOR, MSP_RAW_IMU, MSP_STATUS,
 };
 use darter_core::preset::Preset;
 use darter_core::quad::{hover_throttle, Quad};
 use darter_core::record::{FcSample, RecordHeader, RecordWriter, Sample, SitlProvenance};
 use darter_core::sha256::sha256_hex;
-use darter_core::sitl::{fdm_from_state, rc_packet, SimLink};
+use darter_core::sensor::{SensorConfig, SensorModel};
+use darter_core::sitl::{fdm_from_state, fdm_from_state_imu, rc_packet, SimLink};
 use darter_core::DVec3;
 
 const SUBSTEP_DT: f64 = 125e-6; // 8 kHz core step
@@ -82,6 +84,24 @@ struct Args {
     determinism_check: bool,
     bin: String,
     throttle: f64,
+    sensors: bool,
+    sensor_cfg: Option<SensorConfig>,
+    /// Yaw stick value (Fly phase), for yaw-axis stability probes.
+    yaw: f64,
+    /// Sim time after which the yaw stick returns to zero.
+    yaw_until: f64,
+    /// Pitch stick value (Fly phase), for pitch-axis stability probes.
+    pitch: f64,
+    /// Sim time after which the pitch stick returns to zero.
+    pitch_until: f64,
+    /// Roll stick value (Fly phase), for roll-axis stability probes.
+    roll: f64,
+    /// Sim time after which the roll stick returns to zero.
+    roll_until: f64,
+    /// Feed the GPS-stale sentinel the SITL looks for (sitl.c skips
+    /// setVirtualGPS when |lat|>90 or |lon|>180): the virtual GPS never
+    /// fixes, isolating baro+inertial altitude behaviour.
+    gps_stale: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -94,7 +114,19 @@ fn parse_args() -> Result<Args, String> {
         determinism_check: false,
         bin: DEFAULT_BIN.into(),
         throttle: DEFAULT_THROTTLE,
+        sensors: false,
+        sensor_cfg: None,
+        yaw: 0.0,
+        yaw_until: f64::INFINITY,
+        pitch: 0.0,
+        pitch_until: f64::INFINITY,
+        roll: 0.0,
+        roll_until: f64::INFINITY,
+        gps_stale: false,
     };
+    // Set when the --sensors spec pinned a seed, so a bare --sensors follows
+    // the run seed (same --seed reproduces the same noise stream).
+    let mut sensor_seed_given = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = |name: &str| -> Result<String, String> {
@@ -109,11 +141,58 @@ fn parse_args() -> Result<Args, String> {
             "--out" => a.out = val("out")?,
             "--profile" => a.profile = Some(val("profile")?),
             "--bin" => a.bin = val("bin")?,
+            "--yaw" => a.yaw = val("yaw")?.parse().map_err(|_| "--yaw wants -1..1")?,
+            "--yaw-until" => {
+                a.yaw_until = val("yaw-until")?.parse().map_err(|_| "--yaw-until wants seconds")?
+            }
+            "--pitch" => a.pitch = val("pitch")?.parse().map_err(|_| "--pitch wants -1..1")?,
+            "--pitch-until" => {
+                a.pitch_until = val("pitch-until")?.parse().map_err(|_| "--pitch-until wants seconds")?
+            }
+            "--roll" => a.roll = val("roll")?.parse().map_err(|_| "--roll wants -1..1")?,
+            "--roll-until" => {
+                a.roll_until = val("roll-until")?.parse().map_err(|_| "--roll-until wants seconds")?
+            }
             "--throttle" => {
                 a.throttle = val("throttle")?.parse().map_err(|_| "--throttle wants 0..1")?
             }
             "--determinism-check" => a.determinism_check = true,
+            "--gps-stale" => a.gps_stale = true,
+            s if s == "--sensors" || s.starts_with("--sensors=") => {
+                a.sensors = true;
+                let mut cfg = a.sensor_cfg.unwrap_or(SensorConfig::DEFAULT);
+                if let Some(spec) = arg.strip_prefix("--sensors=") {
+                    for kv in spec.split(',') {
+                        let (k, v) = kv.split_once('=')
+                            .ok_or_else(|| format!("--sensors spec wants key=value, got {kv}"))?;
+                        let f = match k {
+                            "gyro_noise" => &mut cfg.gyro_noise_std,
+                            "gyro_bias" => &mut cfg.gyro_bias_std,
+                            "gyro_rw" => &mut cfg.gyro_bias_rw_std,
+                            "accel_noise" => &mut cfg.accel_noise_std,
+                            "vib_accel" => &mut cfg.vib_accel_amp,
+                            "vib_gyro" => &mut cfg.vib_gyro_amp,
+                            "vib2" => &mut cfg.vib2_scale,
+                            "seed" => {
+                                cfg.seed = v.parse().map_err(|_| "--sensors seed wants u64")?;
+                                sensor_seed_given = true;
+                                continue;
+                            }
+                            other => return Err(format!("--sensors unknown key {other}")),
+                        };
+                        *f = v.parse().map_err(|_| format!("--sensors {k} wants f64"))?;
+                    }
+                }
+                a.sensor_cfg = Some(cfg);
+            }
             other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    // The sensor model follows the run seed unless the spec pinned one, so
+    // the same --seed reproduces the same noise stream (recorded inputs).
+    if let Some(cfg) = &mut a.sensor_cfg {
+        if !sensor_seed_given {
+            cfg.seed = a.seed;
         }
     }
     if a.mode != "core" && a.mode != "closed" {
@@ -153,6 +232,7 @@ struct RunOutcome {
     // Closed mode only.
     servo_packets: u64,
     msp_errors: u64,
+    sensors: bool,
     sitl: Option<SitlInfo>,
 }
 
@@ -222,6 +302,7 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
             preset: preset.name,
             profile: vec![format!("hover_throttle={thr:.6}")],
             sitl: None,
+            sensors: None,
         })
         .map_err(|e| format!("record header: {e}"))?;
 
@@ -262,6 +343,7 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
         loop_max_ms: *loop_ms.last().unwrap_or(&0.0),
         servo_packets: 0,
         msp_errors: 0,
+        sensors: false,
         sitl: None,
     })
 }
@@ -409,17 +491,26 @@ fn spawn_telemetry(
                 next_att += TELEM_ATT_PERIOD;
                 let att = link.request_v1(MSP_ATTITUDE).map(|p| decode_attitude(&p));
                 let motors = link.request_v1(MSP_MOTOR).map(|p| decode_motor(&p));
+                let imu = link.request_v1(MSP_RAW_IMU).map(|p| decode_raw_imu(&p));
+                let alt = link.request_v1(MSP_ALTITUDE).map(|p| decode_estimated_altitude(&p));
                 let mut st = sh.lock().unwrap();
-                if let (Ok(Some(a)), Ok(m)) = (att, motors) {
+                if let (Ok(Some(a)), Ok(m), Ok(Some(i)), Ok(Some(alt))) = (att, motors, imu, alt) {
                     let (arm, flags) = st.status.last().map(|s| (s.1, s.2)).unwrap_or((0, 0));
                     st.latest = Some(FcSample {
-                        att_cdeg: [a.roll_cdeg as i32, a.pitch_cdeg as i32, a.yaw_cdeg as i32],
+                        att_cdeg: [a.roll_decdeg as i32, a.pitch_decdeg as i32, a.yaw_deg as i32],
                         motors: [
                             norm(*m.first().unwrap_or(&1000)),
                             norm(*m.get(1).unwrap_or(&1000)),
                             norm(*m.get(2).unwrap_or(&1000)),
                             norm(*m.get(3).unwrap_or(&1000)),
                         ],
+                        gyro_raw: [
+                            i.gyro_raw[0] as f64,
+                            i.gyro_raw[1] as f64,
+                            i.gyro_raw[2] as f64,
+                        ],
+                        alt_cm: alt.alt_cm,
+                        vario_cms: alt.vario_cms,
                         arming_disable: arm,
                         flight_flags: flags,
                     });
@@ -489,6 +580,7 @@ fn fly_closed(
                 sha256: sitl_info.sha256.clone(),
                 version: sitl_info.version.clone(),
             }),
+            sensors: args.sensor_cfg.clone(),
         })
         .map_err(|e| format!("record header: {e}"))?;
 
@@ -526,6 +618,7 @@ fn fly_closed(
             loop_max_ms: *loop_ms.last().unwrap_or(&0.0),
             servo_packets: lo.servo_packets,
             msp_errors,
+            sensors: args.sensors,
             sitl: Some(sitl_info),
         }
     })
@@ -555,8 +648,9 @@ fn fly_loop(
     sim_link: &SimLink,
     telem: &Arc<Mutex<TelemState>>,
 ) -> Result<LoopOutcome, String> {
-    let origin_lat = 47.6;
-    let origin_lon = -122.3;
+    // --gps-stale feeds an out-of-range lat/lon the SITL treats as the GPS
+    // sentinel (sitl.c: skip the update so the virtual GPS goes stale).
+    let (origin_lat, origin_lon) = if args.gps_stale { (999.0, 999.0) } else { (47.6, -122.3) };
     let total_ticks = (duration / TICK_DT).floor() as usize;
     let mut loop_ms = Vec::with_capacity(total_ticks);
     let mut max_alt = 0.0f64;
@@ -567,6 +661,9 @@ fn fly_loop(
     let mut phase_entered = 0.0f64;
     let mut armed_at: Option<f64> = None;
     let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, 0.5));
+    // Sensor model seeded from the run seed; None keeps the fdm path
+    // bit-identical to the pre-sensor harness.
+    let mut sensor = args.sensor_cfg.as_ref().map(|c| SensorModel::new(*c));
 
     for tick in 0..total_ticks {
         let tick_start = Instant::now();
@@ -577,7 +674,7 @@ fn fly_loop(
             let st = telem.lock().unwrap();
             st.status.last().map(|s| (s.1, s.2)).unwrap_or((u32::MAX, 0))
         };
-        let (thr, aux3, next_phase) = match phase {
+        let (thr, aux3, yaw, pitch, roll, next_phase) = match phase {
             ArmPhase::WaitGrace => {
                 if t - phase_entered > GRACE_TIMEOUT_S {
                     return Err(format!(
@@ -585,9 +682,9 @@ fn fly_loop(
                     ));
                 }
                 if arm == 0 {
-                    (0.0, DISARMED_US, Some(ArmPhase::WaitArmed))
+                    (0.0, DISARMED_US, 0.0, 0.0, 0.0, Some(ArmPhase::WaitArmed))
                 } else {
-                    (0.0, DISARMED_US, None)
+                    (0.0, DISARMED_US, 0.0, 0.0, 0.0, None)
                 }
             }
             ArmPhase::WaitArmed => {
@@ -597,9 +694,9 @@ fn fly_loop(
                     ));
                 }
                 if arm == 0 && flags & 1 != 0 {
-                    (0.0, ARMED_US, Some(ArmPhase::Fly))
+                    (0.0, ARMED_US, 0.0, 0.0, 0.0, Some(ArmPhase::Fly))
                 } else {
-                    (0.0, ARMED_US, None)
+                    (0.0, ARMED_US, 0.0, 0.0, 0.0, None)
                 }
             }
             ArmPhase::Fly => {
@@ -611,7 +708,10 @@ fn fly_loop(
                 } else {
                     args.throttle
                 };
-                (thr, ARMED_US, None)
+                let yaw = if t < args.yaw_until { args.yaw } else { 0.0 };
+                let pitch = if t < args.pitch_until { args.pitch } else { 0.0 };
+                let roll = if t < args.roll_until { args.roll } else { 0.0 };
+                (thr, ARMED_US, yaw, pitch, roll, None)
             }
         };
         if let Some(next) = next_phase {
@@ -623,12 +723,21 @@ fn fly_loop(
             phase_entered = t;
         }
         sim_link
-            .send_rc(&rc_packet(0.0, 0.0, 0.0, thr, aux3))
+            .send_rc(&rc_packet(roll, pitch, yaw, thr, aux3))
             .map_err(|e| format!("send rc: {e}"))?;
 
         for _ in 0..SUBSTEPS_PER_TICK {
             quad.step(SUBSTEP_DT);
-            let pkt = fdm_from_state(&quad, origin_lat, origin_lon, t);
+            let pkt = match sensor.as_mut() {
+                Some(s) => {
+                    let (g, a) = quad.imu();
+                    let rpm_mean = quad.rpm.iter().sum::<f64>() / 4.0;
+                    let thr_mean = quad.throttle.iter().sum::<f64>() / 4.0;
+                    let (gn, an) = s.step(SUBSTEP_DT, g, a, rpm_mean, thr_mean);
+                    fdm_from_state_imu(&quad, gn, an, origin_lat, origin_lon, t)
+                }
+                None => fdm_from_state(&quad, origin_lat, origin_lon, t),
+            };
             sim_link.send_fdm(&pkt).map_err(|e| format!("send fdm: {e}"))?;
         }
         let (motors, n) = sim_link.try_recv_motors();
@@ -768,6 +877,7 @@ fn write_summary(out_dir: &Path, args: &Args, o: &RunOutcome) -> Result<(), Stri
     s.push_str(&format!("    \"p99\": {:.3},\n", o.loop_p99_ms));
     s.push_str(&format!("    \"max\": {:.3}\n", o.loop_max_ms));
     s.push_str("  },\n");
+    s.push_str(&format!("  \"sensors\": {},\n", o.sensors));
     s.push_str(&format!("  \"att_samples\": {},\n", o.att_samples));
     match o.armed_at_s {
         Some(t) => s.push_str(&format!("  \"armed_at_s\": {:.3},\n", t)),

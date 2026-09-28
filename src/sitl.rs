@@ -143,9 +143,32 @@ const SEA_LEVEL_PRESSURE: f64 = 101325.0;
 /// assumption that the first packet arrives at the spawn position.
 pub fn fdm_from_state(quad: &Quad, origin_lat: f64, origin_lon: f64, timestamp: f64) -> FdmPacket {
     let (gyro, accel) = quad.imu(); // FLU body frame
+    fdm_from_state_imu(quad, gyro, accel, origin_lat, origin_lon, timestamp)
+}
 
-    // FLU -> FRD is Rx(pi): x unchanged, y and z negated.
-    let imu_angular_velocity_rpy = [gyro.x, -gyro.y, -gyro.z];
+/// Explicit-IMU variant: the sensor model (src/sensor.rs) hands us noisy
+/// gyro/accel in place of the rigid-body truth. With the clean `quad.imu()`
+/// values this is bit-identical to `fdm_from_state`.
+pub fn fdm_from_state_imu(
+    quad: &Quad,
+    gyro: crate::DVec3,
+    accel: crate::DVec3,
+    origin_lat: f64,
+    origin_lon: f64,
+    timestamp: f64,
+) -> FdmPacket {
+
+    // FLU -> FRD is Rx(pi): x unchanged, y and z negated. The yaw component
+    // keeps FLU polarity (+CCW from above) instead of the plugin's FRD
+    // (CW-positive): with an FRD-polarity feed this SITL build's yaw
+    // PID+mixer chain runs positive feedback and diverges (observed
+    // 2026-09-28); FLU polarity keeps the loop bounded and stick right
+    // bursts CW like a real props-in quad (tests/sitl_loop.rs). Measured
+    // fidelity gap with the default profile: after the burst the yaw loop
+    // either limit-cycles about the burst heading or escalates into a spin
+    // the FC disarms via RUNAWAY_TAKEOFF (varies run to run at the same
+    // seed) — documented in tests/sitl_loop.rs, not fixed here.
+    let imu_angular_velocity_rpy = [gyro.x, -gyro.y, gyro.z];
     let imu_linear_acceleration_xyz = [accel.x, -accel.y, -accel.z];
 
     // Plugin convention: q conjugated by Rx(pi) == qy/qz negated.
@@ -301,6 +324,38 @@ mod tests {
         assert!(pkt.position_xyz[2].abs() < 1e-9);
         // ENU velocity passthrough (ground branch leaves a small bounce).
         assert!(pkt.velocity_xyz[2].abs() < 0.01);
+    }
+
+    /// The fdm feed's Rx(pi) body mapping, pinned component by component:
+    /// gyro (wx, wy, wz) -> (wx, -wy, wz), accel -> (ax, -ay, -az), quat
+    /// qy/qz negated. The yaw component deliberately keeps FLU polarity
+    /// (+CCW from above) instead of the plugin's FRD CW-positive — see the
+    /// comment at the mapping in fdm_from_state_imu. If this test fails
+    /// someone changed the sign convention that the closed-loop behaviour
+    /// in tests/sitl_loop.rs depends on.
+    #[test]
+    fn fdm_body_mapping_rx_pi() {
+        let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, 10.0));
+        quad.throttle = [0.0; 4];
+        // Hand-set a spinning state: pitch rate +1 rad/s, yaw CCW +2 rad/s.
+        quad.state.omega = DVec3::new(0.5, 1.0, 2.0);
+        // 90-deg yaw quat (about world z): qy = 0, qz != 0, so the sign flip
+        // on the quat's y/z components is actually exercised.
+        quad.state.quat = crate::DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        quad.step(0.001); // populate the proper-acceleration IMU read
+        let (gyro, accel) = quad.imu();
+        let pkt = fdm_from_state(&quad, 47.0, -122.0, 1.0);
+        // The packet must equal the Rx(pi) mapping of the FLU IMU read: x
+        // unchanged, y and z negated — except the yaw gyro component, which
+        // deliberately keeps FLU polarity (+CCW from above) instead of FRD's
+        // CW-positive (see the comment at the mapping in fdm_from_state_imu).
+        assert_eq!(pkt.imu_angular_velocity_rpy, [gyro.x, -gyro.y, gyro.z]);
+        assert_eq!(pkt.imu_linear_acceleration_xyz, [accel.x, -accel.y, -accel.z]);
+        let [qw, qx, qy, qz] = pkt.imu_orientation_quat;
+        let q = quad.state.quat;
+        assert!((qw - q.w).abs() < 1e-12 && (qx - q.x).abs() < 1e-12);
+        assert!((qy + q.y).abs() < 1e-12 && (qz + q.z).abs() < 1e-12);
+        assert!(qz != 0.0, "yaw quat must actually exercise the sign flip");
     }
 
     #[test]

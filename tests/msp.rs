@@ -75,7 +75,7 @@ fn golden_attitude() {
         assert_eq!(f.cmd, MSP_ATTITUDE);
         let a = decode_attitude(&f.payload).expect("attitude payload");
         // Captured with the craft level and disarmed.
-        assert_eq!((a.roll_cdeg, a.pitch_cdeg, a.yaw_cdeg), (0, 0, 0));
+        assert_eq!((a.roll_decdeg, a.pitch_decdeg, a.yaw_deg), (0, 0, 0));
     }
 }
 
@@ -244,4 +244,39 @@ fn request_v2_checksum_covers_payload() {
 fn request_v1_frame_bytes(cmd: u16) -> Vec<u8> {
     let cmd = u8::try_from(cmd).unwrap();
     [b"$M<" as &[u8], &[0u8], &[cmd], &[crc8_xor(&[0, cmd])]].concat()
+}
+
+/// MSP 102 RAW_IMU: 3 acc i16, 3 gyro-dps i16, 3 mag i16 — the gyro triplet is
+/// the filtered signal the PID loop sees.
+#[test]
+fn raw_imu_decoder_layout() {
+    let mut p = Vec::new();
+    for v in [-100i16, 2, 250, -950, 0, 31, -400, 1, 999] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    let r = decode_raw_imu(&p).expect("decoded");
+    assert_eq!(r.acc, [-100, 2, 250]);
+    assert_eq!(r.gyro_raw, [-950, 0, 31]);
+    assert_eq!(r.mag, [-400, 1, 999]);
+    assert!(decode_raw_imu(&p[..17]).is_none(), "short payload rejected");
+}
+
+/// MSP 109 ALTITUDE: i32 LE relative altitude cm, i16 LE vario cm/s
+/// (msp.c `case MSP_ALTITUDE`: getEstimatedAltitudeCm, getEstimatedVario).
+#[test]
+fn estimated_altitude_decoder_layout() {
+    let mut p = Vec::new();
+    p.extend_from_slice(&(-13_000i32).to_le_bytes());
+    p.extend_from_slice(&(-412i16).to_le_bytes());
+    let r = decode_estimated_altitude(&p).expect("decoded");
+    assert_eq!(r.alt_cm, -13_000);
+    assert_eq!(r.vario_cms, -412);
+    assert!(decode_estimated_altitude(&p[..5]).is_none(), "short payload rejected");
+    // Positive climb, vario zero (USE_VARIO off on real hardware is legal).
+    let mut q = Vec::new();
+    q.extend_from_slice(&40_000i32.to_le_bytes());
+    q.extend_from_slice(&0i16.to_le_bytes());
+    let r2 = decode_estimated_altitude(&q).expect("decoded");
+    assert_eq!(r2.alt_cm, 40_000);
+    assert_eq!(r2.vario_cms, 0);
 }

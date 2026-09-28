@@ -12,6 +12,7 @@ pub mod preset;
 pub mod quad;
 pub mod radio;
 pub mod record;
+pub mod sensor;
 pub mod sha256;
 pub mod sitl;
 
