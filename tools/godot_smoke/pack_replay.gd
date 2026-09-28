@@ -78,11 +78,10 @@ var done := false
 
 func _ready() -> void:
 	_load_pack_and_build_scene()
+	# Bundled record fallback, same reason as the pack (see above).
 	var path := OS.get_environment("DARTER_RECORD")
 	if path == "":
-		push_error("DARTER_RECORD not set")
-		get_tree().quit(1)
-		return
+		path = "res://record/flight.jsonl"
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
 		push_error("cannot open record %s" % path)
@@ -109,11 +108,11 @@ func _ready() -> void:
 
 
 func _load_pack_and_build_scene() -> void:
+	# Android launches carry no environment: fall back to the pack bundled in
+	# the APK (tools/godot_smoke/pack, gitignored; local builds only).
 	var dir := OS.get_environment("DARTER_PACK")
 	if dir == "":
-		push_error("DARTER_PACK not set")
-		get_tree().quit(1)
-		return
+		dir = "res://pack"
 	var t0 := Time.get_ticks_usec()
 
 	var pf := FileAccess.open(dir + "/pack.json", FileAccess.READ)
@@ -127,9 +126,13 @@ func _load_pack_and_build_scene() -> void:
 		get_tree().quit(1)
 		return
 
-	var of := FileAccess.open(dir + "/scene.obj", FileAccess.READ)
+	# Bundled copies live under res:// where Godot would treat a bare .obj as
+	# an importable model (and our per-chunk OBJ is not an importable model),
+	# so the bundled file carries a non-importable extension.
+	var obj_name := "scene.packobj" if dir.begins_with("res://") else "scene.obj"
+	var of := FileAccess.open(dir + "/" + obj_name, FileAccess.READ)
 	if of == null:
-		push_error("cannot open scene.obj in %s" % dir)
+		push_error("cannot open %s in %s" % [obj_name, dir])
 		get_tree().quit(1)
 		return
 	var text := of.get_as_text()
@@ -166,6 +169,11 @@ func _load_pack_and_build_scene() -> void:
 	add_child(cam)
 	cam.current = true
 	cam.far = 3000.0
+	# Godot's 0.05 default near wastes most of the 24-bit depth range over a
+	# 3 km far plane (~12 mm precision at 100 m): coplanar pack surfaces
+	# (roads 50 mm over the ground) z-fight well inside the view. The chase
+	# cam never approaches anything nearer than ~4 m, so 1.0 buys 20x.
+	cam.near = 1.0
 
 	# The summary is written after the last frame (in _process); keep the
 	# pack block around until then.
@@ -414,7 +422,10 @@ func _process(_delta: float) -> void:
 	)
 	if entries.size() >= total_frames and not done:
 		done = true
+		# App user data dir is the only writable path on Android.
 		var out := OS.get_environment("DARTER_REPLAY_OUT")
+		if out == "":
+			out = OS.get_user_data_dir() + "/replay.json"
 		var g := FileAccess.open(out, FileAccess.WRITE)
 		if g == null:
 			push_error("cannot write %s" % out)

@@ -2,3 +2,7 @@
 *.swp
 /tools/godot/
 __pycache__/
+/tools/godot_smoke/pack/
+/tools/godot_smoke/record/
+/tools/godot_smoke/build/
+/tools/godot_smoke/.godot/
