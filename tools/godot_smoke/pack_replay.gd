@@ -21,8 +21,10 @@
 # Camera: a chase cam 10 m behind the quad along its recorded velocity and
 # 4 m above, looking at it — a level transit shows the neighbourhood ahead
 # and below. Per-frame the script records sampled positions, brightness
-# mean/variance, and (every frame) the pixel-class fractions sky/veg/man-made
-# sampled on a 16-px grid, plus wall-clock frame deltas; the Rust test
+# mean/variance, the pixel-class fractions sky/veg/man-made sampled on a
+# 16-px grid (every sample_every-th frame — the full-res readback cost ~25%
+# of throughput on the Adreno 830 when run every frame), and wall-clock
+# frame deltas for every frame; the Rust test
 # asserts on all of these (positions vs the record, non-blank frames,
 # man-made geometry actually filling part of the frame, and a second run
 # reproducing the deterministic projection).
@@ -75,8 +77,17 @@ var cam: Camera3D
 # runs one extra _process after get_tree().quit()).
 var done := false
 
+# Pixel-class gate interval. 1 samples every frame (the desktop T7 contract);
+# the Android replay carries no env and pays the readback tax, so it samples
+# every 4th frame. DARTER_SAMPLE_EVERY overrides both (resolved in _ready).
+var sample_every := 1
+
 
 func _ready() -> void:
+	sample_every = 4 if OS.has_feature("android") else 1
+	var env_se := OS.get_environment("DARTER_SAMPLE_EVERY")
+	if env_se != "":
+		sample_every = maxi(1, int(env_se))
 	_load_pack_and_build_scene()
 	# Bundled record fallback, same reason as the pack (see above).
 	var path := OS.get_environment("DARTER_RECORD")
@@ -377,47 +388,56 @@ func _process(_delta: float) -> void:
 	dir = dir.normalized()
 	cam.position = quad.position - dir * 10.0 + Vector3(0.0, 4.0, 0.0)
 	cam.look_at(quad.position, Vector3.UP)
-	await RenderingServer.frame_post_draw
-	var img: Image = get_viewport().get_texture().get_image()
+	# Pixel gates read the full framebuffer back from the GPU — on mobile that
+	# cost ~25% of throughput per frame (Adreno 830, 2376x1080) — so they run
+	# every sample_every-th frame. du is recorded every frame either way, so
+	# the frame-pacing data is never gated.
 	var bm_val := -1.0
 	var bv_val := -1.0
 	var sky_val := -1.0
 	var veg_val := -1.0
 	var mm_val := -1.0
-	if img != null and not img.is_empty():
-		var n := 0.0
-		var s := 0.0
-		var s2 := 0.0
-		var sky_n := 0
-		var veg_n := 0
-		var mm_n := 0
-		var h := img.get_height()
-		var w := img.get_width()
-		for y in range(0, h, 16):
-			for x in range(0, w, 16):
-				var c := img.get_pixel(x, y)
-				var l: float = c.get_luminance()
-				s += l
-				s2 += l * l
-				n += 1.0
-				# Sky is blue-dominant; vegetation green-dominant; man-made
-				# surfaces (brick, render, roofs, asphalt, concrete) are red
-				# or neutral.
-				if c.b > c.r * 1.15 and c.b > c.g * 1.05:
-					sky_n += 1
-				elif c.g > c.r * 1.12 and c.g > c.b * 1.05:
-					veg_n += 1
-				else:
-					mm_n += 1
-		var mean := s / n
-		bm_val = mean
-		bv_val = s2 / n - mean * mean
-		sky_val = float(sky_n) / n
-		veg_val = float(veg_n) / n
-		mm_val = float(mm_n) / n
+	if fidx % sample_every == 0:
+		await RenderingServer.frame_post_draw
+		var img: Image = get_viewport().get_texture().get_image()
+		if img != null and not img.is_empty():
+			var n := 0.0
+			var s := 0.0
+			var s2 := 0.0
+			var sky_n := 0
+			var veg_n := 0
+			var mm_n := 0
+			var h := img.get_height()
+			var w := img.get_width()
+			for y in range(0, h, 16):
+				for x in range(0, w, 16):
+					var c := img.get_pixel(x, y)
+					var l: float = c.get_luminance()
+					s += l
+					s2 += l * l
+					n += 1.0
+					# Sky is blue-dominant; vegetation green-dominant; man-made
+					# surfaces (brick, render, roofs, asphalt, concrete) are red
+					# or neutral.
+					if c.b > c.r * 1.15 and c.b > c.g * 1.05:
+						sky_n += 1
+					elif c.g > c.r * 1.12 and c.g > c.b * 1.05:
+						veg_n += 1
+					else:
+						mm_n += 1
+			var mean := s / n
+			bm_val = mean
+			bv_val = s2 / n - mean * mean
+			sky_val = float(sky_n) / n
+			veg_val = float(veg_n) / n
+			mm_val = float(mm_n) / n
+	# Render-info counters are cheap reads (last completed frame) and proved
+	# decisive for pass/culling questions, so every entry carries them.
+	var pr_val := int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME))
+	var dr_val := int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))
 	entries.append(
-		"{\"f\":%d,\"t\":%.3f,\"px\":%.6f,\"py\":%.6f,\"pz\":%.6f,\"bm\":%.9f,\"bv\":%.9f,\"sky\":%.4f,\"veg\":%.4f,\"mm\":%.4f,\"du\":%d}" % [
-			fidx, float(r["t"]), px, py, pz, bm_val, bv_val, sky_val, veg_val, mm_val, dt_wall
+		"{\"f\":%d,\"t\":%.3f,\"px\":%.6f,\"py\":%.6f,\"pz\":%.6f,\"bm\":%.9f,\"bv\":%.9f,\"sky\":%.4f,\"veg\":%.4f,\"mm\":%.4f,\"du\":%d,\"pr\":%d,\"dr\":%d}" % [
+			fidx, float(r["t"]), px, py, pz, bm_val, bv_val, sky_val, veg_val, mm_val, dt_wall, pr_val, dr_val
 		]
 	)
 	if entries.size() >= total_frames and not done:
