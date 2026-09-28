@@ -484,7 +484,12 @@ def write_obj(pack, path):
             if L < 0.5:
                 continue
             nx, ny = -dy / L * half_w, dx / L * half_w
-            z = 0.01 + 0.001 * ((k * 7) % 5)
+            # 50 mm over the ground quad with 5 mm steps between segments:
+            # depth precision is ~d^2/(near*2^24) (near=1.0 in the smoke
+            # camera), so the old 10 mm base fought the ground beyond ~100 m
+            # and the 1 mm inter-road steps fought at junctions (flicker seen
+            # on-device, 2026-09-28).
+            z = 0.05 + 0.005 * ((k * 7) % 5)
             # winding flipped vs the naive order: A,B,C,D (the +n side first)
             # winds the quad DOWNWARD for a segment along +y (verified in the
             # source against backface culling from the air); D,C,B,A faces up.
@@ -492,7 +497,7 @@ def write_obj(pack, path):
                     (x1 + nx, y1 + ny, z), (x0 + nx, y0 + ny, z)])
         for k in range(1, len(geom) - 1):
             cx, cy = geom[k]
-            z = 0.016
+            z = 0.075  # above every road-segment level (max 0.07)
             r_c = half_w / math.cos(math.pi / 8.0)
             ring = [(cx + r_c * math.cos(math.pi / 4.0 * i + math.pi / 8.0),
                      cy + r_c * math.sin(math.pi / 4.0 * i + math.pi / 8.0))
