@@ -218,10 +218,14 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
         return Err(format!("min vegetation fraction {min_veg:.3} < 0.10"));
     }
     // Man-made content: buildings/roads fill part of every frame. The
-    // measured mins/means on the fixture pack are ~0.44/~0.52; gates sit
-    // well under with margin for lighting variation.
-    if mean_mm < 0.25 {
-        return Err(format!("mean man-made fraction {mean_mm:.3} < 0.25"));
+    // measured mins/means on the fixture pack were ~0.44/~0.52 under the
+    // flat-look lighting (dark sky); the S1 lit-sky look (blue sky fills
+    // ~34% of every frame, measured 2026-09-29) moves them to
+    // ~0.14/~0.18, so the mean bound follows the look down: purpose
+    // unchanged (man-made geometry visible in every frame), min bound
+    // stays the operative per-frame floor.
+    if mean_mm < 0.12 {
+        return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
     }
     if min_mm < 0.10 {
         return Err(format!("min man-made fraction {min_mm:.3} < 0.10"));

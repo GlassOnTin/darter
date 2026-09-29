@@ -82,6 +82,10 @@ var done := false
 # every 4th frame. DARTER_SAMPLE_EVERY overrides both (resolved in _ready).
 var sample_every := 1
 
+# Lighting preset (S1 art pass). Selected by env DARTER_LIGHTING; the tests
+# never set it, so the default pins the canon run.
+const LIGHTING_PRESETS := preload("lighting_presets.gd")
+
 
 func _ready() -> void:
 	sample_every = 4 if OS.has_feature("android") else 1
@@ -345,33 +349,33 @@ func _material_for(name: String) -> StandardMaterial3D:
 
 
 func _build_world() -> void:
+	var preset_name := OS.get_environment("DARTER_LIGHTING")
+	if preset_name == "":
+		preset_name = LIGHTING_PRESETS.DEFAULT_NAME
+	var preset := LIGHTING_PRESETS.get_preset(preset_name)
+	if preset.is_empty():
+		get_tree().quit(1)
+		return
+	# Dev/metering-only knob: override the preset's frozen tonemap exposure
+	# while solving it against the grey-card target (165/255) or eyeballing
+	# presets. Tests never set this env, so the shipped determinism path
+	# always uses the frozen value.
+	var env_exposure := OS.get_environment("DARTER_TONEMAP_EXPOSURE")
+	if env_exposure != "":
+		preset["tonemap_exposure"] = float(env_exposure)
+
 	var env := Environment.new()
 	var sky := Sky.new()
-	sky.sky_material = ProceduralSkyMaterial.new()
-	env.background_mode = Environment.BG_SKY
-	env.sky = sky
-	# Light aerial haze: softens the far ground (no LOD yet — stated gap) and
-	# gives the flat-colour look depth.
-	env.fog_enabled = true
-	env.fog_density = 0.0015
-	env.fog_light_color = Color(0.75, 0.78, 0.82)
+	var sky_mat := ProceduralSkyMaterial.new()
+	sky.sky_material = sky_mat
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
-
 	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-50.0, 35.0, 0.0)
-	sun.shadow_enabled = true
-	# The compatibility renderer's default PSSM-4 over max_distance renders
-	# the whole scene 5x per frame (4 shadow passes + main; measured 510k
-	# prims at this pack size). Two splits over 200 m render it 3x (306k) —
-	# a 40% GPU-work cut for battery/thermal — with the near-field shadows
-	# and the grid pixel classes unchanged on the Adreno 830. The scene
-	# holds vsync-locked 60 fps either way (8x-copy probe), so this is a
-	# work cut, not a throughput unlock.
-	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS
-	sun.directional_shadow_max_distance = 200.0
 	add_child(sun)
+	# The preset carries the whole LB03 lighting model mapped to Godot
+	# (sun, fog beta, ambient, tonemap) — see lighting_presets.gd.
+	LIGHTING_PRESETS.apply(preset, env, sky_mat, sun)
 
 
 func _process(_delta: float) -> void:
