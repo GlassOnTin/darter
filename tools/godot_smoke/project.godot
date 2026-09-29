@@ -17,6 +17,20 @@ window/size/viewport_height=360
 
 [rendering]
 
+; S5 shadow-edge fix (2026-09-29): at the device's 2376x1080 the 2048-mobile
+; shadow atlas draws hard texel-stair edges across every diagonal cast shadow
+; (the desktop 640x360 rig cannot see this: the same artifact there is
+; screen-space aliasing and every shadow knob measured inert). Mobile-only:
+; raise the atlas one step to 4096 (teeth shrink ~2x linear) and soften the
+; filter quality from the HARD default to SOFT_VERY_LOW (1 tap -> few-tap PCF,
+; edges get a 1-2 px ramp instead of a hard step). Measured on the
+; device-parity rig (/tmp, 2376x1080): quality alone softens but the tooth
+; outline survives; size alone shrinks but stays crisp; the pair is the
+; smallest change where the stair-steps stop reading at 1:1. Desktop keys
+; stay at engine defaults, so the desktop look and the T7 canon are
+; untouched by construction.
+lights_and_shadows/directional_shadow/size.mobile=4096
+lights_and_shadows/directional_shadow/soft_shadow_filter_quality.mobile=1
 renderer/rendering_method="forward_plus"
 renderer/rendering_method.mobile="gl_compatibility"
 textures/vram_compression/import_etc2_astc=true
