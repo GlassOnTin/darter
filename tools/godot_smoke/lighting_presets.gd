@@ -69,8 +69,16 @@ const PRESETS := {
 		# roof shading darken the walls, so the same exposure measured 0.6388.
 		# Seven metered rounds from 0.054452 converged on 0.6466 (Filmic
 		# shoulder asymptotes just under target, same as S1); frozen value
-		# below, correction factor 1.0338 total (2026-09-29).
-		"tonemap_exposure": 0.056287,
+		# then 0.056287, correction factor 1.0338 total (2026-09-29).
+		# S3 re-solve after the CC0 ground textures multiplied in: the grass
+		# photo's own luminance (mean ~0.27) darkens the base quad, the same
+		# exposure fell to 0.4853. The Filmic shoulder compresses harder with
+		# darker grass — between rounds the local slope dln(bm)/dln(exp) is
+		# only ~0.33 at this level, so the naive meter-episode iterate needed
+		# 12+ rounds; applying the measured slope directly landed 0.6468 in
+		# one round. Frozen value below, total correction 2.384x from the S1
+		# value (2026-09-29).
+		"tonemap_exposure": 0.134214,
 	},
 	"clear_low": {
 		"elev_deg": 26.8643, "az_deg": 236.6901, "cloud": 0.233244,

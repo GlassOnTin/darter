@@ -1,0 +1,21 @@
+# Ground textures — provenance (VISION pillar 3: CC0 sources, recorded)
+
+All three files are DIFFUSE-COLOUR-only crops of the ambientCG 1K-JPG packs
+(1024 px wide; two packs are 1024x715/737 non-square — accepted, tiling is
+isotropic in both axes in the shader and the squash is not visible at the
+repeats we use). Colour-space is sRGB; the loader imports them as Compressed-
+Texture2D with mipmaps (see the committed .import sidecars).
+
+File         Source asset (ambientCG, CC0)                  Downloaded  SHA-256 (Colour jpg)
+grass.jpg    Grass001    https://ambientcg.com/a/Grass001/     2026-09-29  b9b6d61bc3b6137b868a3447eef18737896acd26d58fe2f4b83ce8c0e9d3f8ad
+asphalt.jpg  Asphalt001  https://ambientcg.com/a/Asphalt001/   2026-09-29  9282585546a4cad22f78cf171242466f236faad943b39b82cfc67a393860fd58
+concrete.jpg Concrete001 https://ambientcg.com/a/Concrete001/  2026-09-29  7d9a59eb22ceefcae4b294d8f4fd835386e31613060d3d71d664ca2290de73f3
+
+Licence: all ambientCG assets are CC0 1.0 (public domain dedication); no
+attribution required, recorded here anyway. Only the *_Color.jpg member of
+each zip was kept; the packs' normal/roughness/AO maps are unused (the
+compatibility renderer on mid-range Android gets flat shading plus the
+shader's own noise instead).
+
+Download URLs (exact): https://ambientcg.com/get?file=<Asset>_1K-JPG.zip
+No modifications were made to the colour maps.

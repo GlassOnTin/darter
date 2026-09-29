@@ -75,6 +75,16 @@ const FACADE_MATS := [
 	"render_white", "render_white_plain",
 ]
 const ROOF_MATS := ["tile_brown", "slate"]
+# S3: the three world-horizontal surface materials get the CC0 photo textures.
+const SHADER_GROUND := preload("shaders/ground.gdshader")
+const GROUND_TEX := {
+	"grass": preload("res://textures/grass.jpg"),
+	"asphalt": preload("res://textures/asphalt.jpg"),
+	"concrete": preload("res://textures/concrete.jpg"),
+}
+const GROUND_MATS := ["grass", "asphalt", "concrete"]
+# Metres per texture repeat per material (asphalt grains read finer than lawn).
+const GROUND_TILE := {"grass": 10.0, "asphalt": 6.0, "concrete": 6.0}
 
 var rows: Array = []
 var hz := 250.0
@@ -400,6 +410,13 @@ func _shader_for(name: String) -> Material:
 		rm.shader = SHADER_ROOF
 		rm.set_shader_parameter("albedo", col)
 		m = rm
+	elif name in GROUND_MATS:
+		var gm := ShaderMaterial.new()
+		gm.shader = SHADER_GROUND
+		gm.set_shader_parameter("albedo", col)
+		gm.set_shader_parameter("tex", GROUND_TEX[name])
+		gm.set_shader_parameter("tile_size", float(GROUND_TILE[name]))
+		m = gm
 	else:
 		var sm := StandardMaterial3D.new()
 		sm.albedo_color = col
