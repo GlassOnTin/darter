@@ -37,7 +37,7 @@ const SECONDS := 20.0
 # Fixed surface order (deterministic mesh build); a material present in the
 # OBJ but missing here falls back to grey and is still emitted.
 const MATERIAL_ORDER := [
-	"grass", "asphalt", "concrete", "hedge", "fence",
+	"grass", "asphalt", "concrete", "paint_white", "hedge", "fence",
 	"brick_red", "brick_red_plain", "brick_buff", "brick_buff_plain",
 	"render_white", "render_white_plain",
 	"tile_brown", "slate", "bark",
@@ -47,6 +47,9 @@ const MATERIAL_COLORS := {
 	"grass": Color(0.42, 0.52, 0.30),
 	"asphalt": Color(0.16, 0.16, 0.17),
 	"concrete": Color(0.60, 0.60, 0.58),
+	# S3b lane paint: slightly warm off-white (road-marking paint reads
+	# ~0.8 albedo); neutral-dark enough for the man-made class.
+	"paint_white": Color(0.78, 0.77, 0.74),
 	"hedge": Color(0.22, 0.38, 0.18),
 	"fence": Color(0.45, 0.42, 0.37),
 	"brick_red": Color(0.52, 0.26, 0.19),
@@ -192,7 +195,7 @@ func _load_pack_and_build_scene() -> void:
 	# The pack block of the replay JSON: the loader's own facts, asserted by
 	# the Rust test against pack.json.
 	var groups_json := ""
-	for fam in ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec"]:
+	for fam in ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec", "dash"]:
 		groups_json += "%s\"%s\":%d" % [
 			"" if groups_json == "" else ",", fam, int(group_counts.get(fam, 0))
 		]
@@ -325,7 +328,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 		mat_base[cur_mat] = int(mat_base.get(cur_mat, 0)) + cur_verts.size()
 
 	# Family counts vs pack.json (the consumer-side contract check).
-	var known := ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec"]
+	var known := ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec", "dash"]
 	for fam in group_counts:
 		if not known.has(fam):
 			push_error("unknown o-group family %s" % fam)
@@ -336,6 +339,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 		"bld": int(pack["counts"]["buildings"]),
 		"bldroof": int(pack["counts"]["buildings"]),
 		"tree": int(pack["counts"]["trees"]), "treec": int(pack["counts"]["trees"]),
+		"dash": int(pack["counts"]["dashes"]),
 	}
 	for fam in want:
 		if int(group_counts.get(fam, 0)) != int(want[fam]):

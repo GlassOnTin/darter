@@ -227,6 +227,8 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     // S2 facade/roof shaders (dark-neutral windows, storey bands, per-building
     // roof shade) move mean_mm by <1% and min_mm not at all below the S1
     // floor: the S1 bound set holds without re-baselining (2026-09-29).
+    // S3 CC0 ground textures + S3b lane paint: measured set identical to S2
+    // (mean_bm 0.647, veg 0.412, mm 0.424, sky 0.1635) — no re-baseline.
     if mean_mm < 0.12 {
         return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
     }
@@ -316,6 +318,7 @@ fn assert_pack_counts(pack: &PackSummary, pack_json: &Path) {
         ("bldroof", num_in(counts, "buildings")),
         ("tree", num_in(counts, "trees")),
         ("treec", num_in(counts, "trees")),
+        ("dash", num_in(counts, "dashes")),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), *v))

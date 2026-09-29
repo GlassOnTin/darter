@@ -166,7 +166,8 @@ fn read_pack_text(dir: &Path) -> String {
 /// test calls it on the second copy too, so "identical" never means "junk").
 fn assert_metadata(text: &str, dir: &Path) {
     assert_eq!(str_in(text, "schema"), "darter_area_pack");
-    assert!((num_in(text, "version") - 1.0).abs() < f64::EPSILON);
+    // v2: counts.dashes + paint_white dash OBJ groups (S3b, 2026-09-29).
+    assert!((num_in(text, "version") - 2.0).abs() < f64::EPSILON);
     assert!(str_in(text, "attribution").contains("OpenStreetMap"));
     let elevation = json_object(text, "elevation");
     assert_eq!(str_in(elevation, "model"), "flat");
@@ -282,7 +283,7 @@ fn area_pack_validator_rejects_corruption() {
     let cases: Vec<(&str, String, &str)> = vec![
         (
             "version",
-            text.replacen("\"version\": 1", "\"version\": 2", 1),
+            text.replacen("\"version\": 2", "\"version\": 3", 1),
             "version",
         ),
         (

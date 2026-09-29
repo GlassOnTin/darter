@@ -47,7 +47,9 @@ import urllib.parse
 import urllib.request
 
 SCHEMA = "darter_area_pack"
-VERSION = 1
+# v2: counts.dashes + `o dash_` OBJ groups with material paint_white (v1 packs
+# are rejected by the version check below — rebuild them).
+VERSION = 2
 M_PER_DEG_LAT = 111_320.0
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 MIRROR_URL = "https://overpass.kumi.systems/api/interpreter"
@@ -84,6 +86,16 @@ ROOF_MATS = ["tile_brown", "slate"]
 ALL_WALL_MATS = WALL_MATS_PLAIN + WALL_MATS_WIN
 FOLIAGE_VARIANTS = ["foliage_a", "foliage_b", "foliage_c", "foliage_d"]
 SURFACES = {"asphalt", "concrete"}
+
+# S3b lane-centre dashes: white paint on roads wide enough to carry two lanes
+# (ROAD_WIDTHS values >= 5.0; footway/path at 1.2 and service at 3.5 fall out
+# of the comparison — the width predicate is the whole exclusion rule).
+DASH_MIN_WIDTH = 5.0
+DASH_LEN = 3.0        # dash length along the centreline, m
+DASH_GAP = 6.0        # gap, m (stride 9.0)
+DASH_HALF_W = 0.09    # 0.18 m paint width
+DASH_INSET = 2.0      # start inset from each polyline node, m
+DASH_Z_CAP = 0.070    # never above: junction pads sit at 0.075, 5 mm clear
 
 
 # ---- small geometry helpers (ported) ----------------------------------------
@@ -355,6 +367,10 @@ def build_pack(classified, roads, strips, grass, trees, tree_params, n_tagged,
             "polyline": [[round(x, 3), round(y, 3)] for x, y in geom],
             "kind": kind,
         })
+    # S3b: roads wide enough to carry centre dashes. Counted from the rounded
+    # widths (the same values the OBJ emission gates on), so the JSON count
+    # and the geometry cannot disagree.
+    dashes = sum(1 for r in roads_out if r["width_m"] >= DASH_MIN_WIDTH)
     grass_out = []
     for i, ring in enumerate(grass):
         grass_out.append({
@@ -411,6 +427,7 @@ def build_pack(classified, roads, strips, grass, trees, tree_params, n_tagged,
             "grass": len(grass_out),
             "trees": len(trees_out),
             "trees_tagged": n_tagged,
+            "dashes": dashes,
         },
         "buildings": buildings,
         "roads": roads_out,
@@ -507,6 +524,36 @@ def write_obj(pack, path):
                 b = ring[(i + 1) % 8]
                 w.add([(cx, cy, z), (a[0], a[1], z), (b[0], b[1], z)])
         w.end()
+        # S3b lane-centre dashes: 3.0 m dash / 6.0 m gap along the
+        # centreline. z = own segment's road z + 5 mm (the same 5 mm stagger
+        # the road surfaces were measured good with) capped at 0.070 so the
+        # dash is always >=5 mm under the 0.075 junction pads and never
+        # coplanar with any road level (the 5 mm grid keeps every pair in
+        # the depth-precision-good regime the road emission relies on).
+        # Placement is length-driven, no rng: byte-identical rebuilds.
+        if width >= DASH_MIN_WIDTH:
+            w.begin("dash_" + r["id"], "paint_white")
+            for k in range(len(geom) - 1):
+                (x0, y0), (x1, y1) = geom[k], geom[k + 1]
+                dx, dy = x1 - x0, y1 - y0
+                L = math.hypot(dx, dy)
+                if L < 2.0 * DASH_INSET + DASH_LEN:
+                    continue
+                ux, uy = dx / L, dy / L
+                ndx, ndy = -uy * DASH_HALF_W, ux * DASH_HALF_W
+                z = min(0.05 + 0.005 * ((k * 7) % 5) + 0.005, DASH_Z_CAP)
+                s = DASH_INSET
+                while s + DASH_LEN <= L - DASH_INSET:
+                    ax, ay = x0 + ux * s, y0 + uy * s
+                    bx, by = x0 + ux * (s + DASH_LEN), y0 + uy * (s + DASH_LEN)
+                    # same winding as the road quad above (the -n side first
+                    # faces up; +n-first winds downward)
+                    w.quad([(ax - ndx, ay - ndy, z),
+                            (bx - ndx, by - ndy, z),
+                            (bx + ndx, by + ndy, z),
+                            (ax + ndx, ay + ndy, z)])
+                    s += DASH_LEN + DASH_GAP
+            w.end()
     for s in pack["strips"]:
         kind = "hedge" if s["kind"] == "hedge" else "fence"
         width, height = (HEDGE_W, HEDGE_H) if kind == "hedge" else (FENCE_W, FENCE_H)
@@ -686,6 +733,11 @@ def validate_pack(pack_dir):
     if counts.get("trees_tagged") != sum(
             1 for t in trees if t.get("source") == "tagged"):
         err("counts.trees_tagged != tagged tree count")
+    # S3b: the dash count is derived from the same rounded widths the OBJ
+    # emission gates on, so JSON and geometry are re-asserted independently.
+    if counts.get("dashes") != sum(
+            1 for r in roads if r.get("width_m") >= DASH_MIN_WIDTH):
+        err("counts.dashes != width>=5.0 road count")
 
     # bounds and span, recomputed from the rounded coordinates
     pts = [p for b in buildings for p in b["ring"]]
@@ -795,6 +847,7 @@ def validate_pack(pack_dir):
             "bldroof": len(buildings),
             "tree": len(trees),
             "treec": len(trees),
+            "dash": counts.get("dashes", 0),
         }
         for name, want in want_groups.items():
             if groups.get(name, 0) != want:
