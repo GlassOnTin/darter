@@ -63,10 +63,14 @@ const PRESETS := {
 		# was unlit), (2) lit ProceduralSky at sun:ambient 1:1, then (3) after
 		# porting the UE sun:x10 ratio AND lifting the sky radiance
 		# (sky_energy_multiplier 5.0 — with the palette as radiance the sun
-		# bleached the ground next to a slate-dark sky). Final solve: x10 + x5
-		# structure, 18 metered rounds, landing mean_bm 0.6477 at the frozen
-		# value (2026-09-29).
-		"tonemap_exposure": 0.054452,
+		# bleached the ground next to a slate-dark sky). S1 landing: mean_bm
+		# 0.6477 at exposure 0.054452 (2026-09-29).
+		# S2 re-solve after the facade/roof shaders landed: bands, windows and
+		# roof shading darken the walls, so the same exposure measured 0.6388.
+		# Seven metered rounds from 0.054452 converged on 0.6466 (Filmic
+		# shoulder asymptotes just under target, same as S1); frozen value
+		# below, correction factor 1.0338 total (2026-09-29).
+		"tonemap_exposure": 0.056287,
 	},
 	"clear_low": {
 		"elev_deg": 26.8643, "az_deg": 236.6901, "cloud": 0.233244,

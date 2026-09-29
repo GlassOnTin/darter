@@ -64,12 +64,29 @@ const MATERIAL_COLORS := {
 	"foliage_d": Color(0.27, 0.41, 0.24),
 }
 
+# S2 shader instances. Facades (walls) and roofs get ShaderMaterials built on
+# the S2 shader sources; everything else stays a StandardMaterial3D with the
+# same MATERIAL_COLORS albedo. The per-building seed arrives through the
+# mesh's vertex COLOR channel, not the material.
+const SHADER_FACADE := preload("shaders/facade.gdshader")
+const SHADER_ROOF := preload("shaders/roof.gdshader")
+const FACADE_MATS := [
+	"brick_red", "brick_red_plain", "brick_buff", "brick_buff_plain",
+	"render_white", "render_white_plain",
+]
+const ROOF_MATS := ["tile_brown", "slate"]
+
 var rows: Array = []
 var hz := 250.0
 var total_frames := 0
 var entries: Array = []
 var last_usec := 0
 var group_counts := {}
+# The applied lighting preset (S1), read by the shader material factory for
+# the facade shader's lit_fraction; set by _build_world (which runs before
+# the pack loader).
+var lighting: Dictionary = {}
+var _shader_cache := {}  # material name -> Material
 
 var quad: MeshInstance3D
 var cam: Camera3D
@@ -88,6 +105,11 @@ const LIGHTING_PRESETS := preload("lighting_presets.gd")
 
 
 func _ready() -> void:
+	# World first: the shader materials built by the pack loader read the
+	# lighting preset's windows_lit (S2 facades), so the preset must exist
+	# before _obj_to_mesh runs.
+	_build_world()
+	sample_every = 4 if OS.has_feature("android") else 1
 	sample_every = 4 if OS.has_feature("android") else 1
 	var env_se := OS.get_environment("DARTER_SAMPLE_EVERY")
 	if env_se != "":
@@ -166,7 +188,6 @@ func _load_pack_and_build_scene() -> void:
 		]
 	print("PACK_LOAD_DONE ms=%d groups={%s}" % [load_ms, groups_json])
 
-	_build_world()
 	var mi := MeshInstance3D.new()
 	mi.mesh = mesh
 	add_child(mi)
@@ -210,8 +231,10 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 	var mat_set := false
 	var cur_verts := PackedVector3Array()
 	var cur_norms := PackedVector3Array()
+	var cur_cols := PackedFloat64Array()
 	var cur_idx := PackedInt32Array()
 	var cur_base := -1  # committed verts of this material; set on first "v"
+	var cur_seed := 0.0  # per-chunk (per-building) seed; set on "o"
 	var nv := 0  # global 1-based vertex cursor: face indices count ALL v lines
 	var chunk_v0 := 0  # nv at the current chunk's start
 	var lines := text.split("\n")
@@ -223,17 +246,26 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 				# Commit the previous chunk. Must be inline: resetting packed
 				# arrays inside a helper would not propagate back (by value).
 				if cur_mat != "" and cur_verts.size() > 0:
-					chunks.append([cur_mat, cur_verts, cur_norms, cur_idx])
+					chunks.append([cur_mat, cur_verts, cur_norms, cur_cols, cur_idx])
 					mat_base[cur_mat] = int(mat_base.get(cur_mat, 0)) + cur_verts.size()
 				cur_mat = ""
 				mat_set = false
 				cur_verts = PackedVector3Array()
 				cur_norms = PackedVector3Array()
+				cur_cols = PackedFloat64Array()
 				cur_idx = PackedInt32Array()
 				cur_base = -1
 				chunk_v0 = nv
 				var fam: String = line.substr(2).split("_")[0]
 				group_counts[fam] = int(group_counts.get(fam, 0)) + 1
+				# Per-building seed (S2 shaders): one deterministic number
+				# from the o-group id, constant over the chunk's vertices. It
+				# travels as a vertex COLOR channel because shaders see
+				# varyings only between vertices; identical values on all a
+				# chunk's vertices keep it interpolation-stable.
+				var parts: PackedStringArray = line.substr(2).split("_")
+				var id_n := float(parts[1]) if parts.size() > 1 else 0.0
+				cur_seed = fposmod(sin(id_n * 12.9898) * 43758.5453, 1.0)
 			"u":
 				if line.begins_with("usemtl "):
 					cur_mat = line.substr(7)
@@ -250,6 +282,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 					return null
 				# ENU (x east, y north, z up) -> Godot (x, z, -y), Y up.
 				cur_verts.append(Vector3(p[0], p[2], -p[1]))
+				cur_cols.append(cur_seed)
 				nv += 1
 			"f":
 				var idx: PackedFloat64Array = line.substr(2).split_floats(" ")
@@ -278,7 +311,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 				cur_idx.append(cur_base + i1)
 				cur_idx.append(cur_base + i0)
 	if cur_mat != "" and cur_verts.size() > 0:
-		chunks.append([cur_mat, cur_verts, cur_norms, cur_idx])
+		chunks.append([cur_mat, cur_verts, cur_norms, cur_cols, cur_idx])
 		mat_base[cur_mat] = int(mat_base.get(cur_mat, 0)) + cur_verts.size()
 
 	# Family counts vs pack.json (the consumer-side contract check).
@@ -311,11 +344,12 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 	var surf := {}
 	for ch in chunks:
 		if not surf.has(ch[0]):
-			surf[ch[0]] = [PackedVector3Array(), PackedVector3Array(), PackedInt32Array()]
+			surf[ch[0]] = [PackedVector3Array(), PackedVector3Array(), PackedFloat64Array(), PackedInt32Array()]
 		var s = surf[ch[0]]
 		s[0].append_array(ch[1])
 		s[1].append_array(ch[2])
 		s[2].append_array(ch[3])
+		s[3].append_array(ch[4])
 
 	var mesh := ArrayMesh.new()
 	var used := 0
@@ -329,9 +363,15 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 		arrays.resize(Mesh.ARRAY_MAX)
 		arrays[Mesh.ARRAY_VERTEX] = s[0]
 		arrays[Mesh.ARRAY_NORMAL] = s[1]
-		arrays[Mesh.ARRAY_INDEX] = s[2]
+		# Per-building seed as float grey (S2 shaders read COLOR.r).
+		var cols := PackedColorArray()
+		cols.resize(s[0].size())
+		for i in s[0].size():
+			cols[i] = Color(s[2][i], s[2][i], s[2][i], 1.0)
+		arrays[Mesh.ARRAY_COLOR] = cols
+		arrays[Mesh.ARRAY_INDEX] = s[3]
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-		mesh.surface_set_material(used, _material_for(mat))
+		mesh.surface_set_material(used, _shader_for(mat))
 		used += 1
 	for mat in surf:
 		if not MATERIAL_ORDER.has(mat):
@@ -340,11 +380,33 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 	return mesh
 
 
-func _material_for(name: String) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.albedo_color = MATERIAL_COLORS.get(name, Color(0.5, 0.5, 0.5))
-	m.roughness = 1.0
-	m.metallic = 0.0
+func _shader_for(name: String) -> Material:
+	# Cached per material name: one surface per material but the mesh's
+	# surfaces each hold their own copy anyway; the cache just keeps wall/roof
+	# variants consistent and the factory cheap to re-call.
+	if _shader_cache.has(name):
+		return _shader_cache[name]
+	var col: Color = MATERIAL_COLORS.get(name, Color(0.5, 0.5, 0.5))
+	var m: Material
+	if name in FACADE_MATS:
+		var fm := ShaderMaterial.new()
+		fm.shader = SHADER_FACADE
+		fm.set_shader_parameter("albedo", col)
+		fm.set_shader_parameter("plain_mode", name.ends_with("_plain"))
+		fm.set_shader_parameter("lit_fraction", float(lighting.get("windows_lit", 0.0)))
+		m = fm
+	elif name in ROOF_MATS:
+		var rm := ShaderMaterial.new()
+		rm.shader = SHADER_ROOF
+		rm.set_shader_parameter("albedo", col)
+		m = rm
+	else:
+		var sm := StandardMaterial3D.new()
+		sm.albedo_color = col
+		sm.roughness = 1.0
+		sm.metallic = 0.0
+		m = sm
+	_shader_cache[name] = m
 	return m
 
 
@@ -361,6 +423,9 @@ func _build_world() -> void:
 	# presets. Tests never set this env, so the shipped determinism path
 	# always uses the frozen value.
 	var env_exposure := OS.get_environment("DARTER_TONEMAP_EXPOSURE")
+	if env_exposure != "":
+		preset["tonemap_exposure"] = float(env_exposure)
+	lighting = preset
 	if env_exposure != "":
 		preset["tonemap_exposure"] = float(env_exposure)
 

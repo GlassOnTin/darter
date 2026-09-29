@@ -224,6 +224,9 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     // ~0.14/~0.18, so the mean bound follows the look down: purpose
     // unchanged (man-made geometry visible in every frame), min bound
     // stays the operative per-frame floor.
+    // S2 facade/roof shaders (dark-neutral windows, storey bands, per-building
+    // roof shade) move mean_mm by <1% and min_mm not at all below the S1
+    // floor: the S1 bound set holds without re-baselining (2026-09-29).
     if mean_mm < 0.12 {
         return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
     }
