@@ -89,6 +89,12 @@ const GROUND_MATS := ["grass", "asphalt", "concrete"]
 # Metres per texture repeat per material (asphalt grains read finer than lawn).
 const GROUND_TILE := {"grass": 10.0, "asphalt": 6.0, "concrete": 6.0}
 
+# S4: crowns/hedges tint per world cell; bark/fence get per-pixel noise.
+const SHADER_FOLIAGE := preload("shaders/foliage.gdshader")
+const FOLIAGE_MATS := ["hedge", "foliage_a", "foliage_b", "foliage_c", "foliage_d"]
+const SHADER_SURFACE_NOISE := preload("shaders/surface_noise.gdshader")
+const NOISE_MATS := ["bark", "fence"]
+
 var rows: Array = []
 var hz := 250.0
 var total_frames := 0
@@ -421,6 +427,16 @@ func _shader_for(name: String) -> Material:
 		gm.set_shader_parameter("tex", GROUND_TEX[name])
 		gm.set_shader_parameter("tile_size", float(GROUND_TILE[name]))
 		m = gm
+	elif name in FOLIAGE_MATS:
+		var fom := ShaderMaterial.new()
+		fom.shader = SHADER_FOLIAGE
+		fom.set_shader_parameter("albedo", col)
+		m = fom
+	elif name in NOISE_MATS:
+		var nm := ShaderMaterial.new()
+		nm.shader = SHADER_SURFACE_NOISE
+		nm.set_shader_parameter("albedo", col)
+		m = nm
 	else:
 		var sm := StandardMaterial3D.new()
 		sm.albedo_color = col

@@ -229,6 +229,8 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     // floor: the S1 bound set holds without re-baselining (2026-09-29).
     // S3 CC0 ground textures + S3b lane paint: measured set identical to S2
     // (mean_bm 0.647, veg 0.412, mm 0.424, sky 0.1635) — no re-baseline.
+    // S4 foliage/bark/fence shaders + crown sway: measured set identical to S3
+    // (mean_bm 0.647, veg 0.412, mm 0.424, sky 0.1635) — no re-baseline.
     if mean_mm < 0.12 {
         return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
     }
