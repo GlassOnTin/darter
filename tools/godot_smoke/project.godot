@@ -10,6 +10,16 @@ config/name="darter-replay-smoke"
 run/main_scene="res://replay.tscn"
 config/features=PackedStringArray("4.7")
 
+[editor_plugins]
+
+; Android refresh-vote plugin (v2, hand-rolled AAR): votes the window and the
+; render surface up to the phone's high-refresh tier (>=90 Hz) on app resume.
+; Java sources and the AAR recipe live in refresh_vote/; the export shim in
+; addons/refresh_vote/ tells the gradle build (mandatory for Android now) to
+; merge the AAR. Editor-only shim: the desktop runs (tests/godot*.rs) never
+; load editor plugins, so the T7 canon is untouched by construction.
+enabled=PackedStringArray("res://addons/refresh_vote/plugin.cfg")
+
 [display]
 
 window/size/viewport_width=640
