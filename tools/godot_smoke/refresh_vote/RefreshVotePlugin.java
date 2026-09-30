@@ -27,9 +27,16 @@ import javax.microedition.khronos.opengles.GL10;
  *
  *  1. window vote  - WindowManager.LayoutParams.preferredDisplayModeId +
  *     preferredRefreshRate, set on the lowest supported mode >= 89 Hz whose
- *     physical size matches the currently active mode. Only applied when the
- *     panel is below that threshold (never demote a panel the system or the
- *     user already runs high); re-applied idempotently on every resume.
+ *     physical size matches the currently active mode, re-applied
+ *     idempotently on every resume. Always pinned (not only when the panel
+ *     reads low) because panel mode reads are racy across app transitions on
+ *     ColorOS: measured, create-time Display.getMode() reported the launcher's
+ *     90 Hz while the system was still holding it, then the panel settled to
+ *     60 Hz for this app and nothing lifted it again. The pin is scoped to
+ *     this app's window - WMS applies it only while the window is on top and
+ *     releases it otherwise - so the user's own panel setting is untouched; a
+ *     surface vote alone (Surface.setFrameRate) registers on the SF layer but
+ *     ColorOS's mode decision did not follow it.
  *  2. surface vote - Surface.setFrameRate(value, CHANGE_FRAME_RATE_ALWAYS) on
  *     the GL render surface, with the active or chosen high-tier rate.
  *
@@ -101,10 +108,7 @@ public class RefreshVotePlugin extends GodotPlugin {
 				return;
 			}
 			String modes = modeList(display);
-			Display.Mode target = current;
-			if (current.getRefreshRate() < MIN_VOTE_HZ) {
-				target = pickHigherMode(display, current);
-			}
+			Display.Mode target = pickHigherMode(display, current);
 			if (target == null) {
 				String msg = "window: no mode >= " + MIN_VOTE_HZ + " Hz at "
 						+ current.getPhysicalWidth() + "x"
@@ -116,15 +120,6 @@ public class RefreshVotePlugin extends GodotPlugin {
 				return;
 			}
 			mTargetRate = target.getRefreshRate();
-			if (target == current) {
-				String msg = "window: panel already at high rate ("
-						+ current.getRefreshRate() + " Hz, mode "
-						+ current.getModeId() + "); leaving it; modes: " + modes
-						+ "; displayState=" + display.getState();
-				Log.i(TAG, msg);
-				report(msg);
-				return;
-			}
 			android.view.Window window = activity.getWindow();
 			WindowManager.LayoutParams lp = window.getAttributes();
 			if (lp.preferredDisplayModeId != 0 && lp.preferredDisplayModeId != target.getModeId()) {
@@ -138,8 +133,9 @@ public class RefreshVotePlugin extends GodotPlugin {
 			lp.preferredRefreshRate = target.getRefreshRate();
 			window.setAttributes(lp);
 			String msg = "window vote: mode " + target.getModeId() + " @ "
-					+ target.getRefreshRate() + " Hz (was "
-					+ current.getRefreshRate() + " Hz); modes: " + modes
+					+ target.getRefreshRate() + " Hz (panel reads "
+					+ current.getRefreshRate() + " Hz, mode "
+					+ current.getModeId() + "); modes: " + modes
 					+ "; displayState=" + display.getState();
 			Log.i(TAG, msg);
 			report(msg);
