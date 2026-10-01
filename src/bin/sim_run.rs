@@ -48,6 +48,7 @@ use darter_core::record::{FcSample, RecordHeader, RecordWriter, Sample, SitlProv
 use darter_core::sha256::sha256_hex;
 use darter_core::sensor::{SensorConfig, SensorModel};
 use darter_core::sitl::{fdm_from_state, fdm_from_state_imu, rc_packet, SimLink};
+use darter_core::terrain::{Ground, TerrainGrid};
 use darter_core::wind::{WindConfig, WindModel};
 use darter_core::DVec3;
 
@@ -122,6 +123,11 @@ struct Args {
     /// setVirtualGPS when |lat|>90 or |lon|>180): the virtual GPS never
     /// fixes, isolating baro+inertial altitude behaviour.
     gps_stale: bool,
+    /// Path to a terrain grid sidecar (area_pack.py's terrain.bin): ground
+    /// contact follows the DEM heights, --alt/--x/--y stay AGL offsets in
+    /// the record convention. None = flat ground at z = 0. A missing or bad
+    /// file is a hard error, never a silent flat fallback.
+    terrain: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -151,6 +157,7 @@ fn parse_args() -> Result<Args, String> {
         roll: 0.0,
         roll_until: f64::INFINITY,
         gps_stale: false,
+        terrain: None,
     };
     // Set when the --sensors spec pinned a seed, so a bare --sensors follows
     // the run seed (same --seed reproduces the same noise stream).
@@ -195,6 +202,7 @@ fn parse_args() -> Result<Args, String> {
             "--vz" => a.vz = val("vz")?.parse().map_err(|_| "--vz wants m/s")?,
             "--determinism-check" => a.determinism_check = true,
             "--gps-stale" => a.gps_stale = true,
+            "--terrain" => a.terrain = Some(val("terrain")?),
             s if s == "--wind" || s.starts_with("--wind=") => {
                 // Bare --wind: standard weather (mean calm, W20 moderate).
                 let mut cfg = WindConfig {
@@ -285,6 +293,13 @@ struct SitlInfo {
     profile_readback_ok: bool,
 }
 
+/// Provenance for the terrain grid, when one flew (summary.json only — the
+/// record header is a fixed wire contract and stays untouched).
+struct TerrainInfo {
+    path: String,
+    sha256: String,
+}
+
 struct RunOutcome {
     record_hash: u64,
     ticks: usize,
@@ -308,6 +323,8 @@ struct RunOutcome {
     sensors: bool,
     wind: bool,
     sitl: Option<SitlInfo>,
+    /// Set only when the run flew with a terrain grid (`--terrain`).
+    terrain: Option<TerrainInfo>,
 }
 
 fn run() -> Result<(), String> {
@@ -317,12 +334,31 @@ fn run() -> Result<(), String> {
     if args.duration.is_none() {
         args.duration = Some(if args.mode == "core" { 2.0 } else { CLOSED_DEFAULT_DURATION });
     }
+    // Load the terrain grid before anything flies: a bad --terrain path is a
+    // hard error here, not a silent flat fallback mid-run.
+    let (terrain, terrain_info) = match &args.terrain {
+        Some(path) => {
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("terrain {path}: read: {e}"))?;
+            let grid = TerrainGrid::parse(&bytes).map_err(|e| format!("terrain {path}: {e}"))?;
+            println!(
+                "[sim_run] terrain {path}: grid {}x{}, step {:.0} m, z [{:.1}, {:.1}]",
+                grid.cols, grid.rows, grid.step, grid.z_min, grid.z_max
+            );
+            let info = TerrainInfo {
+                path: path.clone(),
+                sha256: sha256_hex(&bytes),
+            };
+            (Some(grid), Some(info))
+        }
+        None => (None, None),
+    };
 
-    let outcome = match args.mode.as_str() {
+    let mut outcome = match args.mode.as_str() {
         "core" => {
-            let o1 = run_core(&args, "flight.jsonl")?;
+            let o1 = run_core(&args, "flight.jsonl", terrain.as_ref())?;
             if args.determinism_check {
-                let o2 = run_core(&args, "flight2.jsonl")?;
+                let o2 = run_core(&args, "flight2.jsonl", terrain.as_ref())?;
                 if o1.record_hash != o2.record_hash {
                     return Err(format!(
                         "determinism check FAILED: hashes differ {:016x} vs {:016x}",
@@ -333,9 +369,10 @@ fn run() -> Result<(), String> {
             }
             o1
         }
-        "closed" => run_closed(&args)?,
+        "closed" => run_closed(&args, terrain.as_ref())?,
         _ => unreachable!(),
     };
+    outcome.terrain = terrain_info;
 
     let out_dir = PathBuf::from(&args.out);
     write_summary(&out_dir, &args, &outcome)?;
@@ -355,8 +392,14 @@ fn main() {
 
 /// Core-mode flight: scripted throttle (the solved hover value, or
 /// `--throttle` when given — 0 = motors-off tests), no SITL, record every
-/// tick. Identical inputs produce identical record hashes.
-fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
+/// tick. Identical inputs produce identical record hashes. With terrain the
+/// spawn z is AGL over the DEM height (--alt stays an above-ground offset)
+/// and ground contact is the grid.
+fn run_core(
+    args: &Args,
+    record_name: &str,
+    terrain: Option<&TerrainGrid>,
+) -> Result<RunOutcome, String> {
     let duration = args.duration.unwrap_or(2.0);
     let out_dir = PathBuf::from(&args.out);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("out dir: {e}"))?;
@@ -366,7 +409,15 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
         .core_throttle
         .unwrap_or_else(|| hover_throttle(&preset, preset.battery, 1.0, RHO_0));
     println!("[sim_run] core mode: throttle {:.4}, {} s", thr, duration);
-    let mut quad = Quad::new(preset, DVec3::new(args.x, args.y, args.alt));
+    // AGL convention kept: --alt is an offset above the ground under (x, y).
+    // Flat h is a literal 0.0, so the no-terrain spawn is bit-identical.
+    let mut quad = Quad::new(
+        preset,
+        DVec3::new(args.x, args.y, args.alt + terrain.map_or(0.0, |g| g.h_at(args.x, args.y))),
+    );
+    if let Some(grid) = terrain {
+        quad.ground = Ground::Grid(grid.clone());
+    }
     quad.throttle = [thr; 4];
     // Scripted initial velocity (level transit; see the --vx doc comment).
     if args.vx != 0.0 || args.vy != 0.0 || args.vz != 0.0 {
@@ -448,6 +499,7 @@ fn run_core(args: &Args, record_name: &str) -> Result<RunOutcome, String> {
         sensors: false,
         wind: args.wind_cfg.is_some(),
         sitl: None,
+        terrain: None,
     })
 }
 
@@ -475,7 +527,7 @@ fn write_sample(
 
 /// Closed-mode flight: spawn + supervise a SITL child, apply the profile in
 /// RAM, read it back, fly the scripted RC against the closed loop, record.
-fn run_closed(args: &Args) -> Result<RunOutcome, String> {
+fn run_closed(args: &Args, terrain: Option<&TerrainGrid>) -> Result<RunOutcome, String> {
     let duration = args.duration.unwrap_or(8.0);
     let out_dir = PathBuf::from(&args.out);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("out dir: {e}"))?;
@@ -565,7 +617,7 @@ fn run_closed(args: &Args) -> Result<RunOutcome, String> {
         profile,
         profile_readback_ok,
     };
-    fly_closed(args, link, duration, &out_dir, info)
+    fly_closed(args, link, duration, &out_dir, info, terrain)
 }
 
 /// Latest-snapshot store for the telemetry thread.
@@ -673,6 +725,7 @@ fn fly_closed(
     duration: f64,
     out_dir: &Path,
     sitl_info: SitlInfo,
+    terrain: Option<&TerrainGrid>,
 ) -> Result<RunOutcome, String> {
     let sim_link = SimLink::new().map_err(|e| format!("udp bind: {e}"))?;
 
@@ -699,7 +752,7 @@ fn fly_closed(
     let stop = Arc::new(AtomicBool::new(false));
     let (telem, telem_handle) = spawn_telemetry(link, started, Arc::clone(&stop));
 
-    let run_res = fly_loop(args, record, duration, &sim_link, &telem);
+    let run_res = fly_loop(args, record, duration, &sim_link, &telem, terrain);
     stop.store(true, Ordering::Relaxed);
     if telem_handle.join().is_err() {
         eprintln!("[sim_run] telemetry thread panicked");
@@ -732,6 +785,7 @@ fn fly_closed(
             sensors: args.sensors,
             wind: args.wind_cfg.is_some(),
             sitl: Some(sitl_info),
+            terrain: None,
         }
     })
 }
@@ -752,13 +806,16 @@ struct LoopOutcome {
 }
 
 /// The flight loop proper: RC arming state machine, 8 kHz substeps over UDP,
-/// servo feedback, record writing, wall pacing.
+/// servo feedback, record writing, wall pacing. With terrain the closed-mode
+/// spawn sits half a metre above the DEM height at the origin; ground
+/// contact follows the grid from the first substep.
 fn fly_loop(
     args: &Args,
     mut record: RecordWriter,
     duration: f64,
     sim_link: &SimLink,
     telem: &Arc<Mutex<TelemState>>,
+    terrain: Option<&TerrainGrid>,
 ) -> Result<LoopOutcome, String> {
     // --gps-stale feeds an out-of-range lat/lon the SITL treats as the GPS
     // sentinel (sitl.c: skip the update so the virtual GPS goes stale).
@@ -772,7 +829,11 @@ fn fly_loop(
     let mut phase = ArmPhase::WaitGrace;
     let mut phase_entered = 0.0f64;
     let mut armed_at: Option<f64> = None;
-    let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, 0.5));
+    let spawn_z = 0.5 + terrain.map_or(0.0, |g| g.h_at(0.0, 0.0));
+    let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, spawn_z));
+    if let Some(grid) = terrain {
+        quad.ground = Ground::Grid(grid.clone());
+    }
     // Sensor model seeded from the run seed; None keeps the fdm path
     // bit-identical to the pre-sensor harness.
     let mut sensor = args.sensor_cfg.as_ref().map(|c| SensorModel::new(*c));
@@ -1025,14 +1086,24 @@ fn write_summary(out_dir: &Path, args: &Args, o: &RunOutcome) -> Result<(), Stri
             "    \"profile_readback_ok\": {}\n",
             sitl.profile_readback_ok
         ));
-        s.push_str("  }\n");
-    } else {
+        if o.terrain.is_some() {
+            s.push_str("  },\n");
+        } else {
+            s.push_str("  }\n");
+        }
+    } else if o.terrain.is_none() {
         // Trim the trailing comma from the status_samples line.
         if s.ends_with("],\n") {
             s.pop();
             s.pop();
         }
         s.push_str("\n");
+    }
+    if let Some(terr) = &o.terrain {
+        s.push_str("  \"terrain\": {\n");
+        s.push_str(&format!("    \"path\": \"{}\",\n", json_escape(&terr.path)));
+        s.push_str(&format!("    \"sha256\": \"{}\"\n", json_escape(&terr.sha256)));
+        s.push_str("  }\n");
     }
     s.push_str("}\n");
     let path = out_dir.join("summary.json");

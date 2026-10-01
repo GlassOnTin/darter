@@ -9,11 +9,13 @@
 //! instead of any scripted profile.
 //!
 //! usage: sitl_loop [--lat <deg>] [--lon <deg>] [--ramp] [--radio]
+//!     [--terrain <terrain.bin>]
 
 use darter_core::preset::Preset;
 use darter_core::quad::Quad;
 use darter_core::radio::Radio;
 use darter_core::sitl::{fdm_from_state, rc_packet, RcPacket, SimLink};
+use darter_core::terrain::{Ground, TerrainGrid};
 use darter_core::DVec3;
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,7 @@ fn main() {
     let mut origin_lon = -122.0;
     let mut ramp = false;
     let mut radio_path: Option<String> = None;
+    let mut terrain_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -40,17 +43,39 @@ fn main() {
             "--lon" => origin_lon = args.next().and_then(|v| v.parse().ok()).unwrap_or(origin_lon),
             "--ramp" => ramp = true,
             "--radio" => radio_path = Some("/dev/input/js0".to_string()),
+            "--terrain" => {
+                terrain_path = Some(args.next().expect("--terrain needs a path"));
+            }
             other => {
                 eprintln!(
-                    "unknown arg {other}; usage: sitl_loop [--lat <deg>] [--lon <deg>] [--ramp] [--radio]"
+                    "unknown arg {other}; usage: sitl_loop [--lat <deg>] [--lon <deg>] [--ramp] [--radio] [--terrain <terrain.bin>]"
                 );
                 std::process::exit(2);
             }
         }
     }
+    // Missing or malformed file = hard error here: no silent flat fallback.
+    let terrain = match &terrain_path {
+        Some(p) => {
+            let g = TerrainGrid::load(p).unwrap_or_else(|e| {
+                eprintln!("sitl_loop: {e}");
+                std::process::exit(1);
+            });
+            println!(
+                "terrain {p}: grid {}x{}, step {:.0} m, z [{:.1}, {:.1}]",
+                g.cols, g.rows, g.step, g.z_min, g.z_max
+            );
+            Some(g)
+        }
+        None => None,
+    };
 
     let link = SimLink::new().expect("bind UDP 9002");
-    let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, 0.0));
+    let spawn_z = terrain.as_ref().map_or(0.0, |g| g.h_at(0.0, 0.0));
+    let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, spawn_z));
+    if let Some(g) = terrain {
+        quad.ground = Ground::Grid(g);
+    }
     let mut radio =
         radio_path.as_ref().map(|p| Radio::open(p).expect("open radio js device"));
     if radio.is_some() {

@@ -1,6 +1,7 @@
 use crate::air::density;
 use crate::battery::{Battery, BatterySpec};
 use crate::preset::Preset;
+use crate::terrain::Ground;
 use glam::{DQuat, DVec3};
 
 /// Standard gravity (m/s^2).
@@ -156,7 +157,8 @@ fn omega_target_rpm(p: &Preset, d: f64, v_bus: f64, i_seed: f64, v_ax: f64, rho:
 
 /// Rigid-body quad with a bench-calibrated actuator chain (throttle ->
 /// rotor-speed curve -> sag -> thrust/power -> current -> battery), quadratic
-/// per-axis drag on air-relative velocity, and a crude ground plane.
+/// per-axis drag on air-relative velocity, and a ground plane (flat by
+/// default, or the terrain grid a harness installs).
 /// Deterministic: f64 and fixed operation order throughout, so identical
 /// inputs reproduce identical trajectories.
 pub struct Quad {
@@ -177,6 +179,10 @@ pub struct Quad {
     pub i_mot: [f64; 4],
     /// Last proper acceleration (m/s^2, FLU body frame) for the IMU output.
     accel: DVec3,
+    /// Ground plane under the quad: Flat (z = 0) by default, a DEM grid when
+    /// the harness loads one. Kept out of `new()` so every existing call
+    /// site and its trajectories stay byte-identical.
+    pub ground: Ground,
 }
 
 impl Quad {
@@ -190,6 +196,7 @@ impl Quad {
             wind: DVec3::ZERO,
             i_mot: [0.0; 4],
             accel: DVec3::ZERO,
+            ground: Ground::Flat,
         }
     }
 
@@ -305,10 +312,13 @@ impl Quad {
         // Discharge the pack with this step's bus current.
         self.battery.step(dt, i_bus);
 
-        // Crude ground plane: rest at z=0, damp motion. A grounded airframe's
-        // proper acceleration is +1 g, which the free-fall expression misses.
-        if self.state.pos.z <= 0.0 {
-            self.state.pos.z = 0.0;
+        // Ground contact: rest at the ground height under the craft (Flat is
+        // z = 0, the pre-M1 form; height() returns a literal 0.0 there), damp
+        // motion. A grounded airframe's proper acceleration is +1 g, which
+        // the free-fall expression misses.
+        let gh = self.ground.height(self.state.pos.x, self.state.pos.y);
+        if self.state.pos.z <= gh {
+            self.state.pos.z = gh;
             if self.state.vel.z < 0.0 {
                 self.state.vel.z *= -0.2;
             }

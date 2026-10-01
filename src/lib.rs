@@ -16,6 +16,7 @@ pub mod record;
 pub mod sensor;
 pub mod sha256;
 pub mod sitl;
+pub mod terrain;
 pub mod wind;
 
 pub use glam::{DQuat, DVec3};
