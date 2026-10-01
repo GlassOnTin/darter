@@ -15,9 +15,15 @@
 //! AND scene.obj (sorted JSON keys, fixed float rounding/formatting, one
 //! seeded RNG in one fixed order — see tools/area_pack.py).
 //!
-//! Elevation is flat-only in this build; `--elevation glo30` must fail loudly
-//! with NotImplementedError rather than silently producing fake terrain (the
-//! DEM pipeline is a stated gap: rasterio is not in the test environment).
+//! The DEM fixture (tests/fixtures/dem_home_area.tif) is a clip of the
+//! Copernicus GLO-30 home tile around the fixture origin: source tile
+//! N50_00_W002_00 (2400x3600 float32 deflate + floating-point predictor,
+//! sha256 e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134,
+//! fetched 2026-10-01), clipped to rows 283..444 / cols 2174..2344, written
+//! as uncompressed float32 strips by the importer's own decoder and pinned
+//! here by sha256 b298b3a345cfc2c1462a751ecb429f34a2db21a1d0fccd080b6df5094
+//! 33b55cf. glo30 tests assert the pack against that pinned sha, so a DEM
+//! re-clip cannot silently change the grid.
 //!
 //! The tool is stdlib-only Python (no pinned interpreter — provenance lives
 //! in the pack itself: input sha256 + seed + origin, and the byte-identity
@@ -27,6 +33,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FIXTURE: &str = "tests/fixtures/osm_home_area.json";
+const DEM_FIXTURE: &str = "tests/fixtures/dem_home_area.tif";
+/// sha256 of DEM_FIXTURE (provenance in the header; re-clips fail by design).
+const DEM_FIXTURE_SHA256: &str = "b298b3a345cfc2c1462a751ecb429f34\
+a2db21a1d0fccd080b6df509433b55cf";
 const HOME_LAT: f64 = 50.8989;
 const HOME_LON: f64 = -1.0586;
 const SEED: u64 = 5;
@@ -59,9 +69,9 @@ fn run(mut cmd: Command) -> (bool, String, String) {
 }
 
 // ---- minimal readers for the generated (sorted-key, fixed-field) JSON ----
-// pack.json string values carry no braces, so brace matching is safe here.
 
 /// Inner text of a top-level JSON object `"<key>": { ... }`.
+/// (pack.json string values carry no braces, so depth counting is safe.)
 fn json_object<'a>(text: &'a str, key: &str) -> &'a str {
     let pat = format!("\"{key}\": {{");
     let i = text
@@ -75,6 +85,53 @@ fn json_object<'a>(text: &'a str, key: &str) -> &'a str {
         match bytes[j] {
             b'{' => depth += 1,
             b'}' => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    &text[start..j - 1]
+}
+
+/// Inner text of a top-level JSON `"<key>": <value>` where the value is an
+/// object OR an array (buildings/grass/roads/strips/trees are arrays,
+/// bounds/counts/source are objects). Same no-brackets-inside-strings
+/// assumption as json_object.
+fn json_value<'a>(text: &'a str, key: &str) -> &'a str {
+    // newline + single-space indent anchors the search to a TOP-LEVEL
+    // member: counts carries nested "grass"/"roads"/"trees" counters that
+    // would otherwise shadow the arrays of the same names
+    let pat = format!("\n \"{key}\":");
+    let i = text
+        .find(&pat)
+        .unwrap_or_else(|| panic!("key {key} missing in pack.json"));
+    let rest = &text[i + pat.len()..];
+    let start = i + pat.len() + (rest.len() - rest.trim_start().len());
+    let open = text.as_bytes()[start];
+    let close = match open {
+        b'{' => b'}',
+        b'[' => b']',
+        b'"' => {
+            // fixed tool-generated strings (schema, frame): no escapes
+            let end = text[start + 1..].find('"').expect("string value closed")
+                + start
+                + 1;
+            return &text[start + 1..end];
+        }
+        b'0'..=b'9' | b'-' => {
+            // bare number (seed): no nesting inside pack.json numbers
+            let end = text[start..].find(['\n', ',']).expect("number terminated")
+                + start;
+            return text[start..end].trim_end();
+        }
+        b => panic!("key {key}: unexpected value start byte {b}"),
+    };
+    let bytes = text.as_bytes();
+    let mut depth = 1usize;
+    let mut j = start + 1;
+    while depth > 0 {
+        match bytes[j] {
+            b if b == open => depth += 1,
+            b if b == close => depth -= 1,
             _ => {}
         }
         j += 1;
@@ -162,15 +219,14 @@ fn read_pack_text(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("pack.json")).expect("pack.json")
 }
 
-/// The full metadata cross-check (used by the build test; the byte-identity
-/// test calls it on the second copy too, so "identical" never means "junk").
-fn assert_metadata(text: &str, dir: &Path) {
+/// Metadata shared by every pack regardless of elevation model; the callers
+/// add the model-specific elevation block and span identity. Returns the
+/// span derived from the bounds (2*max extent + GROUND_PAD).
+fn assert_common_metadata(text: &str, dir: &Path) -> f64 {
     assert_eq!(str_in(text, "schema"), "darter_area_pack");
-    // v2: counts.dashes + paint_white dash OBJ groups (S3b, 2026-09-29).
-    assert!((num_in(text, "version") - 2.0).abs() < f64::EPSILON);
+    // v3: glo30 elevation object + terrain.bin sidecar (M1, 2026-10-01).
+    assert!((num_in(text, "version") - 3.0).abs() < f64::EPSILON);
     assert!(str_in(text, "attribution").contains("OpenStreetMap"));
-    let elevation = json_object(text, "elevation");
-    assert_eq!(str_in(elevation, "model"), "flat");
     assert!((num_in(text, "seed") - SEED as f64).abs() < f64::EPSILON);
 
     // provenance: the recorded input sha256 must match the fixture bytes
@@ -205,9 +261,6 @@ fn assert_metadata(text: &str, dir: &Path) {
     let max_x = num_in(bounds, "max_x");
     let min_y = num_in(bounds, "min_y");
     let max_y = num_in(bounds, "max_y");
-    let span = 2.0 * min_x.abs().max(max_x.abs()).max(min_y.abs()).max(max_y.abs()) + 200.0;
-    let stored = num_in(text, "span_m");
-    assert!((stored - span).abs() < 0.01, "span {stored} vs derived {span}");
     assert!(max_x.abs().max(min_x.abs()).max(max_y.abs()).max(min_y.abs()) < MAX_EXTENT_M);
     assert!(text.contains("\"origin_inside_building\": false"));
 
@@ -226,6 +279,78 @@ fn assert_metadata(text: &str, dir: &Path) {
     assert_eq!(count_lines(&obj, "o treec_"), counts_t, "treec groups");
     assert!(obj.lines().any(|l| l == "o ground"));
     assert!(obj.lines().any(|l| l.starts_with("v ")), "no vertices");
+    2.0 * min_x.abs().max(max_x.abs()).max(min_y.abs()).max(max_y.abs()) + 200.0
+}
+
+/// Flat-pack metadata: elevation == flat and the GROUND_PAD span formula.
+fn assert_metadata(text: &str, dir: &Path) {
+    let derived = assert_common_metadata(text, dir);
+    let elevation = json_object(text, "elevation");
+    assert_eq!(str_in(elevation, "model"), "flat");
+    let stored = num_in(text, "span_m");
+    assert!((stored - derived).abs() < 0.01, "span {stored} vs derived {derived}");
+}
+
+/// Fixture-only provenance (assert_glo30_metadata is shared with the live
+/// test, whose tile name and sha differ).
+fn assert_dem_fixture_recorded(text: &str) {
+    let elevation = json_object(text, "elevation");
+    assert!(
+        elevation.contains("\"name\": \"dem_home_area.tif\""),
+        "fixture tile name not recorded in the elevation block"
+    );
+    assert!(
+        text.contains(&format!("\"sha256\": \"{DEM_FIXTURE_SHA256}\"")),
+        "fixture sha not recorded in pack.json"
+    );
+}
+
+/// glo30-pack metadata: elevation block shape, the terrain.bin sidecar
+/// (size, datum node == 0), and the snapped span identity (cols-1)*step,
+/// which only rounds the derived span UP.
+fn assert_glo30_metadata(text: &str, dir: &Path) {
+    let derived = assert_common_metadata(text, dir);
+    let elevation = json_object(text, "elevation");
+    assert_eq!(str_in(elevation, "model"), "glo30");
+    assert_eq!(str_in(elevation, "datum"), "origin_ground");
+    assert!(str_in(elevation, "licence").contains("Copernicus"));
+    assert!(str_in(text, "attribution").contains("Copernicus DEM"));
+
+    let cols = num_in(elevation, "cols") as usize;
+    let rows = num_in(elevation, "rows") as usize;
+    let step = num_in(elevation, "step_m");
+    assert!(cols >= 2 && rows >= 2, "degenerate grid {cols}x{rows}");
+    assert!((step - 30.0).abs() < f64::EPSILON, "step {step}");
+
+    // relief envelope: measured on the pinned fixture (2026-10-01,
+    // z -20.5..+74.2); generous bounds catch a re-clip or decoder break
+    // without pinning the exact lattice
+    let z_min = num_in(elevation, "z_min");
+    let z_max = num_in(elevation, "z_max");
+    assert!((-60.0..=-5.0).contains(&z_min), "z_min {z_min} off envelope");
+    assert!((20.0..=150.0).contains(&z_max), "z_max {z_max} off envelope");
+
+    // terrain.bin sidecar: exact size, datum node (0,0) == 0.0
+    let bin = std::fs::read(dir.join("terrain.bin")).expect("terrain.bin");
+    assert_eq!(
+        bin.len(),
+        56 + 8 * cols * rows,
+        "terrain.bin size {} vs 56 + 8*{cols}*{rows}",
+        bin.len()
+    );
+    let z00 = f64::from_le_bytes(bin[56..64].try_into().expect("8 bytes"));
+    assert!((z00 - 0.0).abs() < f64::EPSILON, "datum node not 0.0: {z00}");
+
+    // snapped span: exact (cols-1)*step identity, at most one node step
+    // above the derived span, never below it
+    let stored = num_in(text, "span_m");
+    assert!(
+        (stored - (cols - 1) as f64 * step).abs() < 0.001,
+        "span {stored} != (cols-1)*step {}",
+        (cols - 1) as f64 * step
+    );
+    assert!(stored >= derived - 0.001, "snap {stored} below derived {derived}");
+    assert!(stored - derived < 30.0 + 0.001, "snap {stored} far above {derived}");
 }
 
 #[test]
@@ -237,20 +362,105 @@ fn area_pack_build_validate_metadata() {
 
     let text = read_pack_text(&dir);
     assert_metadata(&text, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-    // the stated elevation gap fails loudly, never with fake terrain.
-    // No positional (that would enter validate mode, which takes precedence).
-    let (ok, _out, err) = run({
+/// glo30 from the committed DEM fixture (offline): build, validate, and
+/// cross-check the elevation block + terrain.bin against the pinned demo
+/// provenance. This is the M1 headline test: DEM -> grid -> drape -> pack.
+fn build_pack_glo30(dir: &Path) {
+    let (ok, stdout, stderr) = run({
         let mut c = tool();
-        c.args(["--osm", FIXTURE, "--elevation", "glo30"]);
+        c.args([
+            "--osm",
+            FIXTURE,
+            "--lat",
+            &HOME_LAT.to_string(),
+            "--lon",
+            &HOME_LON.to_string(),
+            "--seed",
+            &SEED.to_string(),
+            "--elevation",
+            "glo30",
+            "--dem-file",
+            DEM_FIXTURE,
+            "--out",
+        ])
+        .arg(dir);
         c
     });
-    assert!(!ok, "--elevation glo30 must fail, not build a pack");
-    assert!(
-        err.contains("NotImplementedError"),
-        "glo30 must raise NotImplementedError, got: {err}"
-    );
+    assert!(ok, "glo30 build failed: {stdout}{stderr}");
+    println!("build glo30: {stdout}");
+}
+
+#[test]
+fn area_pack_demfile_glo30_build_validate() {
+    let dir = temp_dir("glo30");
+    build_pack_glo30(&dir);
+    let (ok, _out, err) = validate(&dir);
+    assert!(ok, "validator rejected the glo30 pack: {err}");
+    let text = read_pack_text(&dir);
+    assert_glo30_metadata(&text, &dir);
+    assert_dem_fixture_recorded(&text);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn area_pack_demfile_glo30_byte_identical_rebuild() {
+    let a = temp_dir("glo30-byte-a");
+    let b = temp_dir("glo30-byte-b");
+    build_pack_glo30(&a);
+    build_pack_glo30(&b);
+    for name in ["pack.json", "scene.obj", "terrain.bin"] {
+        let fa = std::fs::read(a.join(name)).expect(name);
+        let fb = std::fs::read(b.join(name)).expect(name);
+        assert_eq!(fa, fb, "{name} not byte-identical across glo30 rebuilds");
+        assert!(!fa.is_empty());
+    }
+    let text_b = read_pack_text(&b);
+    assert_glo30_metadata(&text_b, &b);
+    assert_dem_fixture_recorded(&text_b);
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+/// The drape consumes no RNG: the seeded scene streams (grass scatter,
+/// building mats, tree params) must produce the same arrays whether the
+/// geometry is flat or draped, so a glo30 build keeps today's scene and
+/// only the elevation block, the snapped span, and the attribution differ.
+#[test]
+fn area_pack_glo30_drape_rng_untouched() {
+    let flat = temp_dir("drape-flat");
+    let glo = temp_dir("drape-glo");
+    build_pack(&flat);
+    build_pack_glo30(&glo);
+    let flat_text = read_pack_text(&flat);
+    let glo_text = read_pack_text(&glo);
+    // per-object slices (bounds, buildings, counts, frame, grass, roads,
+    // schema, seed, source, strips, trees) and the scalar flag
+    for key in [
+        "bounds",
+        "buildings",
+        "counts",
+        "frame",
+        "grass",
+        "roads",
+        "schema",
+        "seed",
+        "source",
+        "strips",
+        "trees",
+    ] {
+        assert_eq!(
+            json_value(&flat_text, key),
+            json_value(&glo_text, key),
+            "{key} diverged between flat and glo30 (drape consumed RNG?)"
+        );
+    }
+    assert!(flat_text.contains("\"origin_inside_building\": false"));
+    assert!(glo_text.contains("\"origin_inside_building\": false"));
+    let _ = std::fs::remove_dir_all(&flat);
+    let _ = std::fs::remove_dir_all(&glo);
 }
 
 #[test]
@@ -283,7 +493,7 @@ fn area_pack_validator_rejects_corruption() {
     let cases: Vec<(&str, String, &str)> = vec![
         (
             "version",
-            text.replacen("\"version\": 2", "\"version\": 3", 1),
+            text.replacen("\"version\": 3", "\"version\": 2", 1),
             "version",
         ),
         (
@@ -307,7 +517,60 @@ fn area_pack_validator_rejects_corruption() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Opt-in: hits the live Overpass endpoint (network). The assertions stay
+/// terrain-corruption cases (mutate pack.json or terrain.bin, keep the
+/// other files): a flipped elevation-sha hex (file sha no longer matches
+/// the JSON), a truncated sidecar (size check), and one flipped payload
+/// byte of a deep interior node (off the 0.1 m lattice AND off the recorded
+/// sha). tiles[] shas are provenance only — the pack carries no DEM bytes,
+/// so the validator cannot re-derive them; corrupting one there is NOT
+/// caught offline (stated here rather than hidden).
+#[test]
+fn area_pack_validator_rejects_terrain_corruption() {
+    let base = temp_dir("tc-base");
+    build_pack_glo30(&base);
+    let text = read_pack_text(&base);
+    let full_bin = std::fs::read(base.join("terrain.bin")).expect("terrain.bin");
+
+    // target the elevation block's own sha256 (the terrain.bin bytes' sha,
+    // hashed here independently of the tool that recorded it)
+    let mut h = darter_core::sha256::Sha256::new();
+    h.update(&full_bin);
+    let terr_hex = darter_core::sha256::to_hex(&h.finish());
+    let sha_field = format!("\"sha256\": \"{terr_hex}\"");
+    let i = text
+        .find(&sha_field)
+        .expect("terrain.bin sha recorded in pack.json");
+    // hex digits sit at field indices 11..len-2, so the last digit is at
+    // len-2 (len-1 is the closing quote — pointing there ate the quote and
+    // produced an unterminated string)
+    let dig = i + sha_field.len() - 2;
+    let repl = if text.as_bytes()[dig] == b'2' { "3" } else { "2" };
+    let sha_mut = format!("{}{}{}", &text[..dig], repl, &text[dig + 1..]);
+    assert_ne!(sha_mut, text, "sha mutation did not apply");
+
+    let mut truncated = full_bin.clone();
+    truncated.truncate(full_bin.len() - 8);
+    let mut node_flip = full_bin.clone();
+    node_flip[56 + 64] ^= 0x01;
+
+    let cases: Vec<(&str, &str, &Vec<u8>)> = vec![
+        ("terrain-sha", &sha_mut, &full_bin),
+        ("truncate", &text, &truncated),
+        ("node-byte", &text, &node_flip),
+    ];
+    for (name, mutated_json, mutated_bin) in cases {
+        let d = temp_dir(&format!("tc-{name}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("pack.json"), mutated_json).unwrap();
+        std::fs::write(d.join("terrain.bin"), mutated_bin).unwrap();
+        std::fs::copy(base.join("scene.obj"), d.join("scene.obj")).unwrap();
+        let (ok, _out, err) = validate(&d);
+        assert!(!ok, "validator accepted corrupted pack ({name})");
+        assert!(err.contains("INVALID"), "{name}: no INVALID in {err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
 /// loose — remote content is not pinned — but the fetch must produce a
 /// pack that validates, with the fetch date and endpoint recorded.
 #[test]
@@ -339,4 +602,54 @@ fn area_pack_live_fetch() {
     assert!(json_object(json_object(&text, "source"), "fetched").contains("endpoint"));
     assert!(num_in(json_object(&text, "counts"), "buildings") > 0.0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+/// Opt-in: hits the live GLO-30 mirror (network) — the tile-download path
+/// with no --dem-file. Home origin 50.8989 / -1.0586 floors into tile
+/// N50_00_W002_00 (SW-corner naming, verified from the TIFF's own tags);
+/// the recorded full-tile sha must equal the upstream bytes fetched
+/// 2026-10-01 (e2d23f46...2134), so a Copernicus re-publication fails here
+/// honestly and the pin is re-baselined with evidence.
+#[test]
+#[ignore = "needs network (live GLO-30 mirror)"]
+fn area_pack_live_dem_fetch() {
+    let dir = temp_dir("live-dem-pack");
+    let cache = temp_dir("live-dem-cache");
+    let (ok, stdout, stderr) = run({
+        let mut c = tool();
+        c.args([
+            "--osm",
+            FIXTURE,
+            "--lat",
+            &HOME_LAT.to_string(),
+            "--lon",
+            &HOME_LON.to_string(),
+            "--seed",
+            &SEED.to_string(),
+            "--elevation",
+            "glo30",
+            "--dem-cache",
+        ])
+        .arg(&cache)
+        .arg("--out")
+        .arg(&dir);
+        c
+    });
+    assert!(ok, "live glo30 build failed: {stdout}{stderr}");
+    println!("live dem: {stdout}");
+    assert!(
+        stdout.contains("terrain tile: N50_00_W002_00.tif"),
+        "expected the N50_00_W002_00 tile, got: {stdout}"
+    );
+    let (ok, _out, err) = validate(&dir);
+    assert!(ok, "validator rejected the live-fetched glo30 pack: {err}");
+    let text = read_pack_text(&dir);
+    assert_glo30_metadata(&text, &dir);
+    assert!(
+        text.contains(
+            "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134"
+        ),
+        "live tile sha drifted from the 2026-10-01 pin"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cache);
 }
