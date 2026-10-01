@@ -124,7 +124,7 @@ GLO30_URL_TEMPLATE = (
     "Copernicus_DSM_COG_10_{lat}_00_{lon}_00_DEM/"
     "Copernicus_DSM_COG_10_{lat}_00_{lon}_00_DEM.tif")
 GLO30_LICENCE = "© Copernicus DEM / ESA (GLO-30)"
-TERRAIN_MAGIC = 0x31524E54          # b"TRN1" little-endian
+TERRAIN_MAGIC = 0x31524E54          # b"TNR1" little-endian
 TERRAIN_FMT_VERSION = 1             # terrain.bin internal format version
 TERRAIN_HEADER_LEN = 56             # u32 magic + fmt + cols + rows, 5 x f64
 

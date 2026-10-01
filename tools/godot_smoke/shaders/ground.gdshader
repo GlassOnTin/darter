@@ -1,7 +1,10 @@
 // S3 ground shader: CC0 photo texture x material tint x macro noise, for the
 // three world-horizontal surface materials (grass, asphalt, concrete — the
-// base quad, roads and parking pads, paths and paved areas all sit within
-// z <= 0.075 m, so one world-XZ planar projection serves all three).
+// base quad, roads and parking pads, paths and paved areas). On M1 glo30
+// packs those surfaces drape the terrain (each vertex is the local ground
+// plus its small material offset), but the projection below reads world XZ
+// only — height-independent — so one planar projection still serves all
+// three, and the texture scale does not change with relief.
 //
 // UV is world XZ in metres divided by tile_size (10 m per tile): every
 // surface shares the physical texture scale, and hardware repeat tiles the

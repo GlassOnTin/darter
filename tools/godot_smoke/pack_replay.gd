@@ -198,6 +198,17 @@ func _load_pack_and_build_scene() -> void:
 		return
 	var load_ms := (Time.get_ticks_usec() - t0) / 1000
 
+	# Relief (M1): grid z range from pack.json's elevation object, echoed
+	# into the summary so the Rust test asserts the loader is driven by the
+	# same hills pack.json promises. Flat packs carry {"model": "flat"} — no
+	# grid, no relief member; the loader stays replay-ready for flat packs.
+	var relief_json := ""
+	var elev = pack.get("elevation")
+	if elev is Dictionary and elev.get("model", "flat") != "flat":
+		relief_json = "\"relief\":{\"z_min\":%.1f,\"z_max\":%.1f}," % [
+			float(elev["z_min"]), float(elev["z_max"])
+		]
+
 	# The pack block of the replay JSON: the loader's own facts, asserted by
 	# the Rust test against pack.json.
 	var groups_json := ""
@@ -225,16 +236,19 @@ func _load_pack_and_build_scene() -> void:
 	cam.current = true
 	cam.far = 3000.0
 	# Godot's 0.05 default near wastes most of the 24-bit depth range over a
-	# 3 km far plane (~12 mm precision at 100 m): coplanar pack surfaces
-	# (roads 50 mm over the ground) z-fight well inside the view. The chase
-	# cam never approaches anything nearer than ~4 m, so 1.0 buys 20x.
+	# 3 km far plane (~12 mm precision at 100 m): the 50 mm road-over-ground
+	# offsets z-fight well inside the view (on a glo30 pack draped along the
+	# terrain slope, offsets unchanged). With relief, ground can also sit
+	# nearer to the cam than the flat pack's ~4 m margin when the quad flies
+	# low over a rising slope — cam-through-terrain there is an eyeball
+	# question, not a depth-precision one; near stays 1.0 and far stays 3000.
 	cam.near = 1.0
 
 	# The summary is written after the last frame (in _process); keep the
 	# pack block around until then.
 	set_meta("pack_json",
-		"\"pack\":{\"load_ms\":%d,\"materials\":%d,\"groups\":{%s}}" % [
-			load_ms, MATERIAL_ORDER.size(), groups_json
+		"\"pack\":{\"load_ms\":%d,\"materials\":%d,%s\"groups\":{%s}}" % [
+			load_ms, MATERIAL_ORDER.size(), relief_json, groups_json
 		])
 
 

@@ -1,7 +1,10 @@
-//! T7 area-pack renderer integration: a T6 area pack (pack.json + scene.obj)
-//! is loaded by the GDScript pack reader (tools/godot_smoke/pack_replay.gd)
-//! into one ArrayMesh and a real flight record is replayed through the
-//! rendered neighbourhood. The gates, in order:
+//! T7 area-pack renderer integration: an M1 area pack (pack.json +
+//! scene.obj + terrain.bin, GLO-30 relief from the committed fixture DEM) is
+//! loaded by the GDScript pack reader (tools/godot_smoke/pack_replay.gd)
+//! into one ArrayMesh and a real flight record — flown by sim_run over that
+//! same terrain via --terrain, so the hills the camera sees are the hills
+//! the physics flew — is replayed through the rendered neighbourhood. The
+//! gates, in order:
 //!
 //! - the loader's own contract check: its o-group family counts must equal
 //!   pack.json's counts (the consumer side of the T6 writer/validator
@@ -100,6 +103,9 @@ struct Sample {
     veg: f64,
     mm: f64,
     du: u64,
+    /// Render primitives in the last completed frame (measurement only —
+    /// canon() excludes it; the M1 relief growth is measured against it).
+    pr: u64,
 }
 
 /// The deterministic projection for the determinism gate. du is wall-clock
@@ -124,6 +130,9 @@ struct PackSummary {
     load_ms: u64,
     materials: usize,
     groups: Vec<(String, u64)>,
+    /// (z_min, z_max) echoed from pack.json's elevation object (M1); None on
+    /// a flat pack.
+    relief: Option<(f64, f64)>,
 }
 
 fn parse_replay(path: &Path) -> (usize, Vec<Sample>, PackSummary) {
@@ -145,6 +154,7 @@ fn parse_replay(path: &Path) -> (usize, Vec<Sample>, PackSummary) {
             veg: num(e, "veg"),
             mm: num(e, "mm"),
             du: num(e, "du") as u64,
+            pr: num(e, "pr") as u64,
         });
     }
     let frames = num(&text[..i], "frames") as usize;
@@ -157,10 +167,19 @@ fn parse_replay(path: &Path) -> (usize, Vec<Sample>, PackSummary) {
         let (k, v) = pair.split_once(':').expect("group pair");
         groups.push((k.trim().trim_matches('"').to_string(), v.trim().parse().unwrap()));
     }
+    let relief = match text[..i].find("\"relief\":{") {
+        Some(ri) => {
+            let block = &text[..i][ri + "\"relief\":{".len()..];
+            let block = &block[..block.find('}').expect("relief block terminator")];
+            Some((num(block, "z_min"), num(block, "z_max")))
+        }
+        None => None,
+    };
     let pack = PackSummary {
         load_ms: num(&text[..i], "load_ms") as u64,
         materials: num(&text[..i], "materials") as usize,
         groups,
+        relief,
     };
     (frames, samples, pack)
 }
@@ -231,6 +250,10 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     // (mean_bm 0.647, veg 0.412, mm 0.424, sky 0.1635) — no re-baseline.
     // S4 foliage/bark/fence shaders + crown sway: measured set identical to S3
     // (mean_bm 0.647, veg 0.412, mm 0.424, sky 0.1635) — no re-baseline.
+    // M1 glo30 pack (terrain draped, relief -20.5..+74.2 m): measured set
+    // near-identical — mean_bm 0.649, veg 0.426 (min 0.376), mm 0.421
+    // (min 0.366), sky 0.1529 (hills eat ~1 pt of horizon sky) — no
+    // re-baseline.
     if mean_mm < 0.12 {
         return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
     }
@@ -244,8 +267,10 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     dus.sort_unstable();
     let mean_du = dus.iter().sum::<u64>() / dus.len() as u64;
     let p95 = dus[(dus.len() as f64 * 0.95) as usize];
+    // Measurement only (no gate): the M1 relief tri growth is read off this.
+    let mean_pr = samples.iter().map(|s| s.pr).sum::<u64>() / samples.len() as u64;
     Ok(format!(
-        "frames {frames}, mean brightness {mean_bm:.3}, variance {mean_bv:.4}, veg {mean_veg:.3} (min {min_veg:.3}), man-made {mean_mm:.3} (min {min_mm:.3}), sky {mean_sky:.4}, worst pos err {worst_pos:.2e}, frame dt mean {mean_du} us / p95 {p95} us"
+        "frames {frames}, mean brightness {mean_bm:.3}, variance {mean_bv:.4}, veg {mean_veg:.3} (min {min_veg:.3}), man-made {mean_mm:.3} (min {min_mm:.3}), sky {mean_sky:.4}, worst pos err {worst_pos:.2e}, frame dt mean {mean_du} us / p95 {p95} us, pr mean {mean_pr}"
     ))
 }
 
@@ -281,7 +306,20 @@ fn num_in(text: &str, key: &str) -> u64 {
     rest[..end].trim().parse().expect("u64 parse")
 }
 
-/// Build the area pack from the cached fixture (offline).
+/// Same, but a signed/float field (pack.json elevation's z_min/z_max).
+fn fnum_in(text: &str, key: &str) -> f64 {
+    let pat = format!("\"{key}\":");
+    let i = text
+        .find(&pat)
+        .unwrap_or_else(|| panic!("field {key} missing"));
+    let rest = text[i + pat.len()..].trim_start();
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim().parse().expect("f64 parse")
+}
+
+/// Build the area pack from the cached fixture (offline): GLO-30 relief via
+/// the committed fixture DEM (the flagship glo30 path; the flat contract
+/// stays covered by tests/area_pack.rs).
 fn build_pack(dir: &Path) {
     let out = Command::new("python3")
         .args([
@@ -292,6 +330,10 @@ fn build_pack(dir: &Path) {
             &HOME_LAT.to_string(),
             "--lon",
             &HOME_LON.to_string(),
+            "--elevation",
+            "glo30",
+            "--dem-file",
+            "tests/fixtures/dem_home_area.tif",
             "--seed",
             &SEED.to_string(),
             "--out",
@@ -396,6 +438,7 @@ fn godot_pack_replay() {
     let pack_dir = dir.join("pack");
     build_pack(&pack_dir);
     assert!(pack_dir.join("pack.json").exists() && pack_dir.join("scene.obj").exists());
+    assert!(pack_dir.join("terrain.bin").exists(), "glo30 pack must carry terrain.bin");
 
     // The flight: a scripted level transit west into the dense band — hover
     // throttle +0.002 (pre-compensating the T1 spool-up/own-wash dip, a
@@ -412,8 +455,13 @@ fn godot_pack_replay() {
             "--throttle", "0.157",
             "--vx", "-14",
             "--determinism-check",
-            "--out",
+            // The record is no longer pack-independent (M1): it flies the
+            // pack's own terrain (spawn alt + h(spawn), ground contact at
+            // h) — the rendered hills and the simulated hills are one grid.
+            "--terrain",
         ])
+        .arg(pack_dir.join("terrain.bin"))
+        .arg("--out")
         .arg(&rec_dir)
         .output()
         .expect("spawn sim_run");
@@ -432,6 +480,16 @@ fn godot_pack_replay() {
         pack.load_ms, pack.materials, pack.groups
     );
     assert_pack_counts(&pack, &pack_dir.join("pack.json"));
+
+    // Relief echo (M1): the loader's summary must equal pack.json's
+    // elevation block — the hills the camera sees are the contact hills.
+    let pack_json_text = std::fs::read_to_string(pack_dir.join("pack.json")).expect("pack.json");
+    let elev = json_object(pack_json_text.trim(), "elevation");
+    assert_eq!(
+        pack.relief,
+        Some((fnum_in(elev, "z_min"), fnum_in(elev, "z_max"))),
+        "relief echo != pack.json elevation range"
+    );
 
     // Determinism: second full run, identical deterministic projection
     // (positions, brightness, class fractions).
