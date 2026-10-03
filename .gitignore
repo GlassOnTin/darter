@@ -4,6 +4,8 @@
 __pycache__/
 /tools/godot_smoke/pack/
 /tools/godot_smoke/record/
+# regenerable bundle payload (make_bundle.sh); areas/index.json stays tracked
+/tools/godot_smoke/areas/*/
 /tools/godot_smoke/build/
 /tools/godot_smoke/.godot/
 /tools/elevation_cache/

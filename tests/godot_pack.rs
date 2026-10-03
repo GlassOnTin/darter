@@ -816,8 +816,11 @@ const AREAS: &[AreaSpec] = &[
 
 /// (e) The bundle payload must be byte-identical to the offline regen for
 /// every staged file. The suburb row's equality doubles as the proof that
-/// T7's pack build == the bundled suburb payload.
-fn assert_bundle_matches_regen(area: &str, regen: &Path) {
+/// T7's pack build == the bundled suburb payload. T8's own regen lives in
+/// two dirs: the pack build (pack/scene) and the record build (flight.jsonl)
+/// — make_bundle.sh builds both into one scratch dir, so the paths differ
+/// but the comparison is the same.
+fn assert_bundle_matches_regen(area: &str, pack_dir: &Path, rec_dir: &Path) {
     let bundle = PathBuf::from(format!("tools/godot_smoke/areas/{area}"));
     let track = AREAS
         .iter()
@@ -825,9 +828,9 @@ fn assert_bundle_matches_regen(area: &str, regen: &Path) {
         .expect("area in table")
         .track;
     let pairs = [
-        (bundle.join("pack.json"), regen.join("pack.json")),
-        (bundle.join("scene.packobj"), regen.join("scene.obj")),
-        (bundle.join("record.jsonl"), regen.join("flight.jsonl")),
+        (bundle.join("pack.json"), pack_dir.join("pack.json")),
+        (bundle.join("scene.packobj"), pack_dir.join("scene.obj")),
+        (bundle.join("record.jsonl"), rec_dir.join("flight.jsonl")),
         (bundle.join("track.json"), PathBuf::from(track)),
     ];
     for (bundle_path, regen_path) in pairs {
@@ -871,9 +874,18 @@ fn demo_areas() {
     assert_eq!(idx_areas.len(), AREAS.len(), "index area count");
     for (row, spec) in idx_areas.iter().zip(AREAS) {
         assert_eq!(row["name"].as_str().expect("area name"), spec.name, "index order");
-        assert_eq!(row["track"].as_str().expect("track ref"), spec.track, "track ref");
+        // index.json carries the bundle-relative name the loader reads;
+        // spec.track stays the SOURCE track file the record flies from.
+        assert_eq!(row["track"].as_str().expect("track ref"), "track.json", "track ref");
+        assert!(PathBuf::from(spec.track).is_file(), "source track: {}", spec.name);
     }
     assert_eq!(index["attribution"].as_str().expect("attribution"), ATTRIBUTION);
+
+    // Offline stage first (bundle currency proven for every area before the
+    // first replay runs), then the device stage. regen_rows/cli_events carry
+    // what the device stage needs from the offline stage.
+    let mut regen_rows: Vec<Vec<(f64, f64, f64, f64)>> = Vec::new();
+    let mut cli_events: Vec<Vec<serde_json::Value>> = Vec::new();
 
     for spec in AREAS {
         let regen = dir.join(spec.name);
@@ -969,10 +981,20 @@ fn demo_areas() {
         );
 
         // (e) bundle currency before anything runs it.
-        assert_bundle_matches_regen(spec.name, &regen);
+        assert_bundle_matches_regen(spec.name, &regen, &rec_dir);
 
-        // (d) the device path: DARTER_AREA only. Bundle == regen (e), so the
-        // gates read the regen record rows.
+        // The device stage reads these back: rows gate the replay mirror,
+        // CLI events gate the replay's track block.
+        regen_rows.push(rows);
+        cli_events.push(evs.clone());
+        println!("{}: offline gates green (regen, validator, record, envelope, bundle)", spec.name);
+    }
+
+    // (d) the device path: DARTER_AREA only. Bundle == regen (e), so the
+    // gates read the regen record rows.
+    for (k, spec) in AREAS.iter().enumerate() {
+        let rows = regen_rows[k].clone();
+        let evs = cli_events[k].clone();
         let run_dir = dir.join(format!("{}-run", spec.name));
         let run = run_godot_area(&godot, &project, &run_dir, spec.name);
         assert!(run.is_ok(), "{}: DARTER_AREA replay failed: {:?}", spec.name, run.err());
@@ -999,7 +1021,7 @@ fn demo_areas() {
             spec.name
         );
         let rep = parse_track_block(&replay);
-        assert_track_events_match(&rep, evs, spec.name);
+        assert_track_events_match(&rep, &evs, spec.name);
         println!("{} DARTER_AREA: {summary}", spec.name);
 
         // (f) hills determinism spot check: a second device-path run with
