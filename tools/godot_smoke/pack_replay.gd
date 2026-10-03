@@ -43,6 +43,7 @@ const MATERIAL_ORDER := [
 	"render_white", "render_white_plain",
 	"tile_brown", "slate", "bark",
 	"foliage_a", "foliage_b", "foliage_c", "foliage_d",
+	"water",
 ]
 const MATERIAL_COLORS := {
 	"grass": Color(0.42, 0.52, 0.30),
@@ -66,6 +67,10 @@ const MATERIAL_COLORS := {
 	"foliage_b": Color(0.24, 0.38, 0.16),
 	"foliage_c": Color(0.33, 0.48, 0.22),
 	"foliage_d": Color(0.27, 0.41, 0.24),
+	# Water rung: the sea/water patches are paint (a flat albedo, no shader).
+	# Muted and dark; blue-dominant, so its pixels land in the sky pixel class
+	# (there is no water class) — coast's veg floor was re-pinned for that.
+	"water": Color(0.13, 0.20, 0.27),
 }
 
 # S2 shader instances. Facades (walls) and roofs get ShaderMaterials built on
@@ -294,7 +299,7 @@ func _load_pack_and_build_scene() -> void:
 	# The pack block of the replay JSON: the loader's own facts, asserted by
 	# the Rust test against pack.json.
 	var groups_json := ""
-	for fam in ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec", "dash"]:
+	for fam in ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec", "dash", "water"]:
 		groups_json += "%s\"%s\":%d" % [
 			"" if groups_json == "" else ",", fam, int(group_counts.get(fam, 0))
 		]
@@ -434,7 +439,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 		mat_base[cur_mat] = int(mat_base.get(cur_mat, 0)) + cur_verts.size()
 
 	# Family counts vs pack.json (the consumer-side contract check).
-	var known := ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec", "dash"]
+	var known := ["ground", "grass", "road", "hedge", "fence", "bld", "bldroof", "tree", "treec", "dash", "water"]
 	for fam in group_counts:
 		if not known.has(fam):
 			push_error("unknown o-group family %s" % fam)
@@ -446,6 +451,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 		"bldroof": int(pack["counts"]["buildings"]),
 		"tree": int(pack["counts"]["trees"]), "treec": int(pack["counts"]["trees"]),
 		"dash": int(pack["counts"]["dashes"]),
+		"water": int(pack["counts"].get("water", 0)),
 	}
 	for fam in want:
 		if int(group_counts.get(fam, 0)) != int(want[fam]):

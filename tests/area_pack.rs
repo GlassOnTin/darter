@@ -616,7 +616,7 @@ struct DemoArea {
 // committed clip covers every node.
 const DEMO_AREAS: &[DemoArea] = &[
     DemoArea { name: "city",  lat: 50.9060, lon: -1.4012, seed: 11, osm_sha256: "84d5a655f5507e639dba5ab08cf8e7b110c238d3352d466622b1f6c146d170a8", dem_sha256: "44f286eba288248851253c760d463f90d4920b2164225b968105d333be7282d0", full_tile_sha256: "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134", glo30_tile: "N50_00_W002_00", min_elements: 3793, min_buildings: 1740, min_roads: 1488, z_min: -2.8, z_max: 36.9, min_span_m: 2190.0 },
-    DemoArea { name: "coast", lat: 50.8130, lon: -1.3070, seed: 13, osm_sha256: "21dfdcca691bfc102efb135427aff3fffa9aefcc97def1f215bc076534da469e", dem_sha256: "84d3ce38735ea9b36ef1d9af374c0b500d422fa311f8e1aa6e6015e8dfa54168", full_tile_sha256: "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134", glo30_tile: "N50_00_W002_00", min_elements: 191, min_buildings: 162, min_roads: 22, z_min: -1.7, z_max: 16.6, min_span_m: 1950.0 },
+    DemoArea { name: "coast", lat: 50.8130, lon: -1.3070, seed: 13, osm_sha256: "d22680be8978f761e140eefe110d2cf4d52299813d96378309276549417eda29", dem_sha256: "84d3ce38735ea9b36ef1d9af374c0b500d422fa311f8e1aa6e6015e8dfa54168", full_tile_sha256: "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134", glo30_tile: "N50_00_W002_00", min_elements: 191, min_buildings: 162, min_roads: 22, z_min: -1.7, z_max: 16.6, min_span_m: 1950.0 },
     DemoArea { name: "hills", lat: 50.9761, lon: -0.9457, seed: 17, osm_sha256: "e226352c4583c938fb7345e0c377dd85646e399ccd6f9c22b474a891132bfb49", dem_sha256: "870d4f9318b7047c11d2eabd246ae0c5dbb9e93c3012517bf75150e7af435884", full_tile_sha256: "09609412e26651cfdc4ccf0e336f66581f4af64145670a11aae13848c7429c6d", glo30_tile: "N50_00_W001_00", min_elements: 304, min_buildings: 143, min_roads: 133, z_min: -94.2, z_max: 124.9, min_span_m: 4530.0 },
 ];
 
@@ -939,6 +939,270 @@ fn demo_areas_index_commit() {
         assert_eq!(crossing, MAX_CROSSINGS.iter().find(|(n, _)| *n == *want_name).expect("crossing pin").1);
         assert!(crossing <= 19.0, "{want_name}: crossing {crossing} beyond 19 s");
     }
+}
+
+// ---- water rung (fixture: osm_water_toy.json, hand-authored: see the
+// generator comment inside the fixture). Two coastline ways share an exact
+// endpoint node and chain into one sea polygon (land inside on the LEFT of
+// the west->east travel, sea on the RIGHT), a closed coastline ring in the
+// sea band is an islet (land inside, CCW -> the sea polygon's hole), and a
+// closed natural=water ring on the land side is an explicit water polygon.
+// Water polygons are clipped to the ground rect and their points are
+// EXCLUDED from bounds/span (the clip box derives from the span: circular).
+// Flat-pack z ladder: water polygons land at 0.020 + 0.002 * k (2 mm
+// stagger against overlapping fills; above the grass drape at 0.005, below
+// the 0.05 road ladder). ----
+
+const WATER_FIXTURE: &str = "tests/fixtures/osm_water_toy.json";
+const WATER_LAT: f64 = 51.0;
+const WATER_LON: f64 = -2.0;
+const WATER_SEED: u64 = 13;
+
+/// Shoelace signed area from a tool-formatted `[\n [x,\n y], ...]` list of
+/// coordinate pairs (open ring: the endpoint is not repeated). Positive =
+/// CCW in the pack's y-north frame.
+fn ring_area(list_text: &str) -> f64 {
+    let bytes = list_text.as_bytes();
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let close = list_text[i..].find(']').expect("pair close");
+            let inner = &list_text[i + 1..i + close];
+            if !inner.contains('[') {
+                let mut it = inner.split(',');
+                let x: f64 = it.next().unwrap().trim().parse().expect("pair x");
+                let y: f64 = it.next().unwrap().trim().parse().expect("pair y");
+                pts.push((x, y));
+            }
+        }
+        i += 1;
+    }
+    assert!(pts.len() >= 3, "ring has {} points, need >= 3", pts.len());
+    let mut a = 0.0;
+    for k in 0..pts.len() {
+        let (x1, y1) = pts[k];
+        let (x2, y2) = pts[(k + 1) % pts.len()];
+        a += x1 * y2 - x2 * y1;
+    }
+    a * 0.5
+}
+
+/// Items of a tool-formatted JSON array's inner text: depth-split on the
+/// top-level brackets (works for `holes`, a list of rings).
+fn list_items(list_text: &str) -> Vec<&str> {
+    let bytes = list_text.as_bytes();
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut open = false;
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => {
+                depth += 1;
+                if depth == 1 {
+                    start = i;
+                    open = true;
+                }
+            }
+            b']' => {
+                depth -= 1;
+                if open && depth == 0 {
+                    items.push(&list_text[start..=i]);
+                    open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+/// Inner text of an entry-level `"<key>": <value>` member (container
+/// values only; pack strings carry no key names).
+fn json_member<'a>(text: &'a str, key: &str) -> &'a str {
+    let pat = format!("\"{key}\": ");
+    let i = text
+        .find(&pat)
+        .unwrap_or_else(|| panic!("member {key} missing"));
+    let bytes = text.as_bytes();
+    let start = i + pat.len();
+    let open = bytes[start];
+    let close = match open {
+        b'{' => b'}',
+        b'[' => b']',
+        _ => panic!("member {key}: value is not a container"),
+    };
+    let mut depth = 1usize;
+    let mut j = start + 1;
+    while depth > 0 {
+        match bytes[j] {
+            b if b == open => depth += 1,
+            b if b == close => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    &text[start + 1..j - 1]
+}
+
+fn build_water_pack(dir: &Path) {
+    let (ok, stdout, stderr) = run({
+        let mut c = tool();
+        c.args([
+            "--osm",
+            WATER_FIXTURE,
+            "--lat",
+            &WATER_LAT.to_string(),
+            "--lon",
+            &WATER_LON.to_string(),
+            "--seed",
+            &WATER_SEED.to_string(),
+            "--out",
+        ])
+        .arg(dir);
+        c
+    });
+    assert!(ok, "water-pack build failed: {stdout}{stderr}");
+}
+
+#[test]
+fn area_pack_water_polygons() {
+    let dir = temp_dir("water");
+    build_water_pack(&dir);
+    let text = read_pack_text(&dir);
+
+    // the validator's water rules (area identity, ring orientation, counts)
+    let (ok, _out, err) = validate(&dir);
+    assert!(ok, "validator rejected the water pack: {err}");
+
+    // counts.water == 2 (sea + lake; the islet is a hole, not a polygon)
+    let counts = json_object(&text, "counts");
+    let n_water = num_in(counts, "water") as usize;
+    assert_eq!(n_water, 2, "sea + lake");
+    assert_eq!(text.matches("\"id\": \"w").count(), 2, "water ids");
+    // building survived alongside the water (ids never collide)
+    assert_eq!(text.matches("\"id\": \"b").count(), 1, "building count");
+    let obj = std::fs::read_to_string(dir.join("scene.obj")).expect("scene.obj");
+    assert_eq!(count_lines(&obj, "o bld_"), 1, "bld groups");
+    assert_eq!(count_lines(&obj, "o water_"), 2, "water groups");
+
+    // bound/span rule: the building alone drives the span here (water
+    // points are excluded). Building max abs = 84 -> 2*84 + 200 = 368;
+    // the ground rect is +-184, so the coastline must be clipped AT the
+    // rect (never wider), and the sea fill still touches the clip edges.
+    let derived_span = 2.0 * (26.0f64.max(84.0)) + 200.0;
+    let stored = num_in(&text, "span_m");
+    assert!((stored - derived_span).abs() < 0.01, "span {stored}");
+
+    let water = json_value(&text, "water");
+    // entries are `{...}` objects in order: w0 = sea, w1 = the lake
+    let entries = water.split('{').collect::<Vec<&str>>();
+    assert_eq!(entries.len(), 3, "two water entries");
+    let sea = entries[1];
+    let lake = entries[2];
+    assert!(sea.contains("\"id\": \"w0\""), "{sea}");
+    assert!(sea.contains("\"kind\": \"sea\""), "w0 is the sea");
+    assert!(lake.contains("\"id\": \"w1\""), "{lake}");
+    assert!(lake.contains("\"kind\": \"water\""), "w1 is the lake");
+    assert!(sea.contains("\"origin\": \"coastline\""), "sea origin");
+    assert!(lake.contains("\"origin\": \"natural=water\""), "lake origin");
+
+    // sea outer ring: CCW, touches the clip rect (the rect half is
+    // derived_span / 2: +-184), and covers the whole clipped chain band
+    let outer = json_member(sea, "outer");
+    let sea_outer = ring_area(outer);
+    assert!(
+        sea_outer > 0.0,
+        "sea outer must be CCW (positive), got {sea_outer}"
+    );
+    assert!(
+        (70_000.0..95_000.0).contains(&sea_outer.abs()),
+        "sea outer area {sea_outer}"
+    );
+    // clip-rect corner vertices survive (the arc closes at the rect)
+    assert!(outer.contains("-184.0"), "sea touches the clip rect: {outer}");
+
+    // the islet hole: a single CW ring, ~1200 m^2 (r=20 dodecagon)
+    let holes = list_items(json_member(sea, "holes"));
+    assert_eq!(holes.len(), 1, "one hole: the islet");
+    let hole_area = ring_area(holes[0]);
+    assert!(
+        hole_area < 0.0,
+        "holes must be CW (negative), got {hole_area}"
+    );
+    assert!(
+        (1000.0..1500.0).contains(&hole_area.abs()),
+        "islet hole area {hole_area}"
+    );
+    // area_m2 == outer + holes (holes carry negative signed area)
+    let area = num_in(sea, "area_m2");
+    assert!(
+        (area - (sea_outer + hole_area)).abs() < 0.5,
+        "sea area_m2 {area} vs rings {sea_outer} + {hole_area}"
+    );
+
+    // the lake: closed natural=water polygon, no holes, ~768 m^2
+    assert_eq!(list_items(json_member(lake, "holes")).len(), 0);
+    let lake_area = num_in(lake, "area_m2");
+    assert!(
+        (700.0..1000.0).contains(&lake_area),
+        "lake area {lake_area} (r=16 dodecagon ~= 768)"
+    );
+
+    // flat-pack z ladder in the OBJ: sea group at 0.020, lake at 0.022
+    for (group, z) in [("water_w0", "0.020"), ("water_w1", "0.022")] {
+        let from = obj
+            .find(&format!("o {group}"))
+            .unwrap_or_else(|| panic!("o {group} present"));
+        let zs = obj[from..]
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.starts_with("o "))
+            .filter(|l| l.starts_with("v "))
+            .map(|l| l.split_whitespace().nth(3).expect("v z").to_string())
+            .collect::<Vec<_>>();
+        assert!(zs.len() >= 3, "{group} has {} verts", zs.len());
+        assert!(
+            zs.iter().all(|zv| zv == z),
+            "{group} z values {zs:?} vs {z}"
+        );
+    }
+
+    // determinism: the pack rebuild is byte-identical (the flat build
+    // writes exactly these two files — no terrain.bin)
+    let dir2 = temp_dir("water-b");
+    build_water_pack(&dir2);
+    let dirs = [dir.clone(), dir2.clone()];
+    for name in ["pack.json", "scene.obj"] {
+        let a = std::fs::read(dirs[0].join(name)).expect(name);
+        let b = std::fs::read(dirs[1].join(name)).expect(name);
+        assert_eq!(a, b, "{name} not byte-identical across rebuilds");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// The water count must not just be present but POLICED: a counts.water
+/// that disagrees with the water array is rejected like any other family.
+#[test]
+fn area_pack_water_count_corruption_rejected() {
+    let dir = temp_dir("water-corrupt");
+    build_water_pack(&dir);
+    let text = read_pack_text(&dir);
+    // counts.water is the unique `"water": 2` literal (the top-level array
+    // starts with `"water": [`, so the digits disambiguate)
+    let key = "\"water\": 2";
+    assert_eq!(text.matches(key).count(), 1, "counts.water entry unique");
+    let corrupt = text.replacen(key, "\"water\": 3", 1);
+    std::fs::write(dir.join("pack.json"), corrupt).expect("write corrupt pack");
+    let (ok, _out, err) = validate(&dir);
+    assert!(!ok, "validator accepted a counts.water mismatch");
+    assert!(
+        err.contains("water"),
+        "rejection should name the family: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// loose — remote content is not pinned — but the fetch must produce a

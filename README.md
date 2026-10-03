@@ -24,8 +24,9 @@ stands today.
 ## What runs today
 
 - Four demo areas (city, suburb, coast, hills) built offline from committed
-  map fixtures and bundled into the app. A picker screen lists them with the
-  OpenStreetMap and Copernicus attribution lines, and each flies a recorded
+  map fixtures and bundled into the app; the coast's sea paints as water from
+  the mapped coastline, islets staying land. A picker screen lists them with
+  the OpenStreetMap and Copernicus attribution lines, and each flies a recorded
   20-second demo flight through six gate rings scored in the HUD.
 - The same bundle runs on Linux and Android. Frame time on a recent Android
   phone (OPPO CPH2655, Adreno 830) averages 11.1 ms in the demo replay, about

@@ -424,6 +424,13 @@ fn assert_pack_counts(pack: &PackSummary, pack_json: &Path) {
         let got = pack.groups.iter().find(|(k, _)| k == fam).unwrap_or_else(|| panic!("family {fam} missing from pack summary"));
         assert_eq!(got.1, *n, "family {fam}: loader saw {} vs pack.json {}", got.1, n);
     }
+    // water: asserted only when the pack carries water — water-free packs
+    // have no counts.water key at all (num_in panics on a missing field).
+    if counts.contains("\"water\":") {
+        let n = num_in(counts, "water");
+        let got = pack.groups.iter().find(|(k, _)| k == "water").map(|g| g.1).unwrap_or(0);
+        assert_eq!(got, n, "family water: loader saw {got} vs pack.json {n}");
+    }
     let strips = num_in(counts, "strips");
     let hedge = pack.groups.iter().find(|(k, _)| k == "hedge").map(|g| g.1).unwrap_or(0);
     let fence = pack.groups.iter().find(|(k, _)| k == "fence").map(|g| g.1).unwrap_or(0);
@@ -760,11 +767,17 @@ const CITY_FLOORS: PixelFloors = PixelFloors {
     min_mm: 0.14,   // measured min 0.295
 };
 
+// Post-water re-pin (2026-10-03): the sea paints as dark water and its
+// blue-dominant pixels land in the sky pixel class (the classifier has no
+// water class), so the vegetation signal drops to the land strip only:
+// measured veg 0.036 (min 0.0000 — over-open-sea frames carry no vegetation
+// at all), mm 0.321 (min 0.272), sky 0.644. min_veg is 0.0 because the
+// measured min IS zero; the empty-scene door is mean_veg.
 const COAST_FLOORS: PixelFloors = PixelFloors {
-    mean_veg: 0.31, // measured 0.634 (2026-10-03)
-    min_veg: 0.26,  // measured min 0.528
-    mean_mm: 0.17,  // measured 0.345
-    min_mm: 0.13,   // measured min 0.276
+    mean_veg: 0.018, // measured 0.036 (2026-10-03, post-water)
+    min_veg: 0.0,    // measured 0.0000 (pure sea+sky frames exist)
+    mean_mm: 0.16,   // measured 0.321
+    min_mm: 0.135,   // measured 0.272
 };
 
 const HILLS_FLOORS: PixelFloors = PixelFloors {

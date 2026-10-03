@@ -50,6 +50,7 @@ import os
 import random
 import struct
 import sys
+import time
 import datetime
 import urllib.error
 import urllib.parse
@@ -62,10 +63,16 @@ SCHEMA = "darter_area_pack"
 # f64 payload, read by the Rust core), draped OBJ (ground becomes a per-cell
 # triangle grid, sinks under buildings/strips, segmented ladder on roads) and
 # the elevation provenance block (v2 packs are rejected — rebuild them).
+# v3 packs may also carry water: counts.water + `o water_*` OBJ groups +
+# a "water" polygon list appear only when the input has coastline ways or
+# closed water rings (see lines ~117 above, solve_water, and the water tests
+# in tests/area_pack.rs); water-free inputs keep the pre-water bytes exactly.
 VERSION = 3
 M_PER_DEG_LAT = 111_320.0
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 MIRROR_URL = "https://overpass.kumi.systems/api/interpreter"
+MAILRU_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+TRY_SLEEP_S = 20.0      # between failed Overpass tries (504s are routine)
 ATTRIBUTION = "© OpenStreetMap contributors, ODbL 1.0"
 
 # ---- scene parameters (ported from ue/suburb_gen.py) ------------------------
@@ -109,6 +116,18 @@ DASH_GAP = 6.0        # gap, m (stride 9.0)
 DASH_HALF_W = 0.09    # 0.18 m paint width
 DASH_INSET = 2.0      # start inset from each polyline node, m
 DASH_Z_CAP = 0.070    # never above: junction pads sit at 0.075, 5 mm clear
+
+# ---- water polygons ------------------------------------------------------------
+# OSM coastline ways (natural=coastline) and closed inland-water rings become
+# draped ground patches: z-staggered planes over the terrain like the grass
+# drape, no holes cut into the ground mesh, no physics impact (the sea is
+# paint this rung; water dynamics are a later rung). Convention per the OSM
+# wiki: land lies to the LEFT of a coastline way's direction of travel, water
+# to the RIGHT, so a closed coastline ring traced CCW encloses land (islet).
+WATER_Z_BASE = 0.020      # first water plane, above the +0.005 grass drape,
+                          # below road rung 1 (0.05 ladder)
+WATER_Z_STAGGER = 0.002   # per polygon in emission order (seas first)
+WATER_MIN_AREA_M2 = 25.0  # a clipped ring below this is dropped, not drawn
 
 # ---- terrain (glo30) elevation ----------------------------------------------
 # Ground contact plane for the physics core and the drawn ground surface: a
@@ -189,8 +208,13 @@ def triangulate_ring(ring):
             i0, i1, i2 = idx[m - 1], idx[m], idx[(m + 1) % len(idx)]
             if cross(ring[i0], ring[i1], ring[i2]) <= 1e-12:
                 continue                    # reflex or degenerate corner
+            # A vertex spatially equal to one of the ear's own vertices sits
+            # ON the ear boundary, not inside it (the keyhole bridge's
+            # duplicated vertex would otherwise poison each corridor-adjacent
+            # ear and stall the clipping into the fan fallback).
             if any(point_in_tri(ring[j], ring[i0], ring[i1], ring[i2])
-                   for j in idx if j not in (i0, i1, i2)):
+                   for j in idx if (ring[j] != ring[i0] and ring[j] != ring[i1]
+                                    and ring[j] != ring[i2])):
                 continue                    # other vertices inside the ear
             tris.append((i0, i1, i2))
             idx.pop(m)
@@ -600,6 +624,7 @@ def parse_scene(data, lat, lon, seed):
                  (g["lat"] - lat) * M_PER_DEG_LAT) for g in geom]
 
     buildings, roads, strips, grass, trees = [], [], [], [], []
+    coast_open, coast_closed, water_rings = [], [], []
     for el in data.get("elements", []):
         tags = el.get("tags", {})
         if el.get("type") == "way" and "building" in tags:
@@ -633,6 +658,31 @@ def parse_scene(data, lat, lon, seed):
                 ring = ring[:-1]
             if len(ring) >= 3:
                 grass.append(ensure_ccw(ring))
+        elif el.get("type") == "way" and tags.get("natural") == "coastline":
+            geom = el.get("geometry") or []
+            if len(geom) < 3:
+                continue
+            poly = to_xy(geom)
+            if poly[0] == poly[-1] and len(poly) >= 4:
+                coast_closed.append(poly[:-1])   # islet: land inside
+            elif len(poly) >= 2:
+                coast_open.append(poly)          # sea side kept via orientation
+        elif el.get("type") == "way" and (
+                tags.get("natural") == "water"
+                or tags.get("landuse") == "reservoir"
+                or tags.get("waterway") in ("riverbank", "dock")):
+            geom = el.get("geometry") or []
+            ring = to_xy(geom)
+            if len(ring) > 2 and ring[0] == ring[-1]:
+                ring = ring[:-1]
+            if len(ring) >= 3:
+                if tags.get("natural") == "water":
+                    origin = "natural=water"
+                elif tags.get("landuse") == "reservoir":
+                    origin = "landuse=reservoir"
+                else:
+                    origin = f"waterway={tags['waterway']}"
+                water_rings.append((ensure_ccw(ring), origin))
 
     # scatter extra trees into grass/garden polygons (OSM tagging is sparse)
     n_tagged = len(trees)
@@ -670,7 +720,363 @@ def parse_scene(data, lat, lon, seed):
         crown_r = rng.uniform(1.4, 2.6)
         tree_params.append((trunk_r, trunk_h, variant, crown_r))
 
-    return classified, roads, strips, grass, trees, tree_params, n_tagged
+    return (classified, roads, strips, grass, trees, tree_params, n_tagged,
+            coast_open, coast_closed, water_rings)
+
+
+# ---- water polygons: coastline -> sea rings -----------------------------------
+# Pure geometry, no rng: clip coastline ways to the ground rect, chain the
+# runs by shared endpoints, close each chain into a CCW sea ring against the
+# rect perimeter, then stitch islets in as holes. Limits, named: an OSM chain
+# that ends inside the area is closed by a straight projection to the nearest
+# rect edge (a data-gap approximation); a ring whose self-intersections cross
+# its own closure is not untangled (the rect clip below is a safety net, not
+# a Boolean engine); overlapping closed chains are not merged.
+
+def _water_key(p):
+    return (round(p[0], 9), round(p[1], 9))
+
+
+def _seg_clip_rect(a, b, half):
+    """Liang-Barsky: segment a->b against [-half, half]^2. Returns (t0, t1)
+    within [0, 1], or None when the segment misses the rect."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t0, t1 = 0.0, 1.0
+    for pi, qi in ((-dx, a[0] + half), (dx, half - a[0]),
+                   (-dy, a[1] + half), (dy, half - a[1])):
+        if pi == 0.0:
+            if qi < 0.0:
+                return None
+        elif pi < 0.0:
+            t0 = max(t0, qi / pi)
+        else:
+            t1 = min(t1, qi / pi)
+    if t0 > t1:
+        return None
+    return t0, t1
+
+
+def _clip_polyline_rect(pts, half):
+    """Cut an open polyline into the runs that lie inside the ground rect
+    (per-segment Liang-Barsky, run accumulation). A run starts at an entry
+    point or the polyline's first inside vertex and ends at an exit point or
+    its true inside end; a chord entering and leaving within one segment
+    becomes a two-point run. Consecutive duplicate vertices collapse."""
+    runs = []
+    cur = None
+
+    def close():
+        if cur is not None:
+            runs.append(cur)
+
+    for k in range(len(pts) - 1):
+        a, b = pts[k], pts[k + 1]
+        span = _seg_clip_rect(a, b, half)
+        if span is None:
+            close()
+            cur = None
+            continue
+        t0, t1 = span
+        if cur is None:
+            cur = [[a[0] + t0 * (b[0] - a[0]), a[1] + t0 * (b[1] - a[1])]]
+        cur.append([a[0] + t1 * (b[0] - a[0]), a[1] + t1 * (b[1] - a[1])])
+        if t1 < 1.0:
+            close()
+            cur = None
+    close()
+    out = []
+    for run in runs:
+        dedup = []
+        for p in run:
+            if not dedup or _water_key(p) != _water_key(dedup[-1]):
+                dedup.append(p)
+        if len(dedup) >= 2:
+            out.append(dedup)
+    return out
+
+
+def _chain_runs(runs):
+    """Glue polyline runs that share an exact endpoint (round-9 keys, either
+    orientation) into chains. Greedy O(n^2) passes until nothing glues —
+    run counts are one per way, at most a few per clipped way."""
+    chains = [list(r) for r in runs]
+
+    def glue(a, b):
+        if _water_key(a[-1]) == _water_key(b[0]):
+            return a + b[1:]
+        if _water_key(a[-1]) == _water_key(b[-1]):
+            return a + b[-2::-1]
+        if _water_key(a[0]) == _water_key(b[-1]):
+            return b + a[1:]
+        if _water_key(a[0]) == _water_key(b[0]):
+            return b[-2::-1] + a
+        return None
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(chains)):
+            ci = chains[i]
+            if ci is None:
+                continue
+            for j in range(i + 1, len(chains)):
+                cj = chains[j]
+                if cj is None:
+                    continue
+                merged = glue(ci, cj)
+                if merged is not None:
+                    chains[i], chains[j] = merged, None
+                    ci = merged
+                    changed = True
+    return [c for c in chains if c is not None]
+
+
+def _perimeter_t(p, half):
+    """Ground-rect perimeter parameter, CCW from the SW corner, t in
+    [0, 8*half): south edge t = x+h, east 2h+(y+h), north 4h+(h-x), west
+    6h+(h-y). Corners SW 0 / SE 2h / NE 4h / NW 6h agree on adjacent edges,
+    so an exact-corner endpoint is unambiguous modulo 8h."""
+    h = half
+    x, y = p
+    eps = 1e-6
+    if y <= -h + eps:
+        return (x + h) % (8.0 * h)
+    if y >= h - eps:
+        return (4.0 * h + (h - x)) % (8.0 * h)
+    if x >= h - eps:
+        return (2.0 * h + (y + h)) % (8.0 * h)
+    return (6.0 * h + (h - y)) % (8.0 * h)
+
+
+def _proj_boundary(p, half):
+    """Chain endpoint on/beyond an edge passes through unchanged (within
+    1e-9); an endpoint strictly inside the rect is clamped onto the nearest
+    edge (ties: south, north, west, east — deterministic)."""
+    if abs(abs(p[0]) - half) < 1e-9 or abs(abs(p[1]) - half) < 1e-9:
+        return p
+    cands = ((p[0], -half), (p[0], half), (-half, p[1]), (half, p[1]))
+    return min(cands, key=lambda q: (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2)
+
+
+def _sea_ring(chain, half):
+    """Close a clipped, chained coastline into a CCW sea ring (interior =
+    water): the chain reversed (sea is then to the LEFT of travel), then the
+    rect perimeter CCW from the travel end's boundary point round to the
+    travel start's boundary projection, then the projection itself, closed
+    by a straight chord. Returns None for a degenerate (< 3 point) ring."""
+    h = half
+    rev = chain[::-1]
+    seq = list(rev)
+    tail = _proj_boundary(rev[-1], h)      # original chain start, boundary pt
+    landing = _proj_boundary(rev[0], h)    # original chain end, boundary pt
+    if _water_key(seq[-1]) != _water_key(tail):
+        seq.append(tail)
+    t_end, t_start = _perimeter_t(tail, h), _perimeter_t(landing, h)
+    span = (t_start - t_end) % (8.0 * h)
+    corners = [((-h, -h), 0.0), ((h, -h), 2.0 * h),
+               ((h, h), 4.0 * h), ((-h, h), 6.0 * h)]
+    rel = sorted(((ct - t_end) % (8.0 * h), c) for c, ct in corners)
+    seq.extend(c for d, c in rel if 1e-6 < d < span - 1e-6)
+    if _water_key(seq[-1]) != _water_key(landing):
+        seq.append(landing)
+    out = []
+    for p in seq:
+        if not out or _water_key(p) != _water_key(out[-1]):
+            out.append([p[0], p[1]])
+    if len(out) > 1 and _water_key(out[0]) == _water_key(out[-1]):
+        out.pop()
+    return out if len(out) >= 3 else None
+
+
+def _sh_clip_ring(ring, half):
+    """Sutherland-Hodgman of a ring against the ground rect (a safety net for
+    boundary float wobble, not a general Boolean engine). Subject may be
+    concave; the clip region is convex so this is sound for simple rings."""
+    out = [[p[0], p[1]] for p in ring]
+    for axis, side in ((0, -1.0), (1, -1.0), (0, 1.0), (1, 1.0)):
+        if len(out) < 3:
+            return []
+        limit = half * side
+        clipped = []
+        for i in range(len(out)):
+            a, b = out[i], out[(i + 1) % len(out)]
+            ain = a[axis] * side <= half + 1e-9
+            bin_ = b[axis] * side <= half + 1e-9
+            if bin_:
+                if not ain:
+                    t = (limit - a[axis]) / (b[axis] - a[axis])
+                    clipped.append([a[0] + t * (b[0] - a[0]),
+                                    a[1] + t * (b[1] - a[1])])
+                clipped.append(b)
+            elif ain:
+                t = (limit - a[axis]) / (b[axis] - a[axis])
+                clipped.append([a[0] + t * (b[0] - a[0]),
+                                a[1] + t * (b[1] - a[1])])
+        out = clipped
+    return out
+
+
+def _seg_cross_point(p1, p2, q1, q2):
+    """Intersection point of segments p1p2 x q1q2 (parametric, inclusive of
+    endpoints within 1e-9), or None when parallel or non-intersecting."""
+    rx, ry = p2[0] - p1[0], p2[1] - p1[1]
+    sx, sy = q2[0] - q1[0], q2[1] - q1[1]
+    denom = rx * sy - ry * sx
+    if abs(denom) < 1e-12:
+        return None
+    qpx, qpy = q1[0] - p1[0], q1[1] - p1[1]
+    t = (qpx * sy - qpy * sx) / denom
+    u = (qpx * ry - qpy * rx) / denom
+    if not (-1e-9 <= t <= 1.0 + 1e-9 and -1e-9 <= u <= 1.0 + 1e-9):
+        return None
+    return (p1[0] + t * rx, p1[1] + t * ry)
+
+
+def _ring_edges(ring):
+    return [(ring[i], ring[(i + 1) % len(ring)]) for i in range(len(ring))]
+
+
+def _corridor_blocked(cor, edges):
+    """True when any edge properly crosses the corridor segment. An
+    intersection within 1e-9 of a corridor endpoint does not block — that is
+    the bridge vertex touching its own/hole edges or the landing vertex."""
+    for e in edges:
+        xpt = _seg_cross_point(cor[0], cor[1], e[0], e[1])
+        if xpt is None:
+            continue
+        d0 = math.hypot(xpt[0] - cor[0][0], xpt[1] - cor[0][1])
+        d1 = math.hypot(xpt[0] - cor[1][0], xpt[1] - cor[1][1])
+        if d0 > 1e-9 and d1 > 1e-9:
+            return True
+    return False
+
+
+def _ring_pts(ring):
+    """Strip the outer/hole/dup tags _bridge_holes keeps next to each vertex."""
+    return [p for p, _ in ring]
+
+
+def _bridge_holes(outer, holes):
+    """Stitch holes into the outer ring (Eberly-style keyhole): for each hole
+    — max-x vertex first, big to small right-to-left — bridge from that
+    vertex to the first visible OUTER ring vertex and splice the hole in as
+    a duplicated-vertex detour. Visible means the corridor crosses no edge
+    already drawn (the outer ring or earlier detours), crosses no hole ring
+    at all — a corridor may not cut through another islet still waiting its
+    turn — and midpoint samples stay inside the drawn ring; landing on a
+    detour vertex instead of the outer ring is what produced un-ear-able
+    multi-fold junctions on the real coast (the landing exemption let the
+    corridor end on an islet's own bridge base). triangulate_ring's
+    containment test skips vertices equal to the ear's own vertices, so the
+    doubled corridor does not poison the neighbouring ears and the clipper
+    makes progress. Returns (ring, dropped): a hole with no visible outer
+    vertex is dropped from the drawn fill (it stays in the pack's holes[],
+    which the area identity keeps counting)."""
+    if not holes:
+        return [[p[0], p[1]] for p in outer], []
+    ring = [[(p[0], p[1]), "outer"] for p in outer]
+    dropped = []
+    for hole in sorted(holes, key=lambda hr: -max(p[0] for p in hr)):
+        hi = max(range(len(hole)), key=lambda i: hole[i][0])
+        base = hole[hi]
+        pts = _ring_pts(ring)
+        edges = (_ring_edges(pts) + _ring_edges(hole)
+                 + [e for other in holes for e in _ring_edges(other)])
+        slot = None
+        for j in range(len(ring)):
+            if ring[j][1] != "outer":
+                continue
+            tgt = ring[j][0]
+            cor = (base, tgt)
+            if _corridor_blocked(cor, edges):
+                continue
+            mids = [(base[0] + f * (tgt[0] - base[0]),
+                     base[1] + f * (tgt[1] - base[1]))
+                    for f in (0.25, 0.5, 0.75)]
+            if all(point_in_poly(mx, my, pts) for mx, my in mids):
+                slot = j
+                break
+        if slot is None:
+            dropped.append(hole)
+            continue
+        cycle = [hole[(hi + k) % len(hole)] for k in range(len(hole))]
+        ring = (ring[:slot + 1]
+                + [[(base[0], base[1]), "dup"]]
+                + [[(p[0], p[1]), "hole"] for p in cycle[1:]]
+                + [[(base[0], base[1]), "dup"]]
+                + ring[slot:])
+    return [[p for p, _ in ring], dropped]
+
+
+def solve_water(coast_open, coast_closed, water_rings, half):
+    """Coastline ways + closed inland-water rings -> the pack's "water"
+    entries (kind "sea" from coastline chains, kind "water" from the rings,
+    seas first) plus human notes. Deterministic end to end: no rng, fixed
+    iteration orders, rounding only via the shared pack rounding. Returns
+    ([], []) when there is no water — water-free packs keep their pre-water
+    bytes exactly."""
+    notes = []
+    islets = []
+    for ring in coast_closed:
+        if all(abs(p[k]) <= half + 1e-9 for p in ring for k in (0, 1)):
+            islets.append(ring)
+        else:
+            notes.append("coastline islet ring touches/exceeds the ground "
+                         "rect — dropped (not a hole of the clipped sea)")
+    runs = []
+    for poly in coast_open:
+        runs.extend(_clip_polyline_rect(poly, half))
+    chains = []
+    for chain in _chain_runs(runs):
+        if _water_key(chain[0]) == _water_key(chain[-1]):
+            islets.append(chain[:-1])          # a closed loop of open ways
+        else:
+            chains.append(chain)
+
+    buildable = []
+    for chain in chains:
+        ring = _sea_ring(chain, half)
+        if ring:
+            buildable.append({"kind": "sea", "origin": "coastline",
+                              "outer": ensure_ccw([[round(x, 3), round(y, 3)]
+                                                   for x, y in ring]),
+                              "holes": []})
+        else:
+            notes.append("coastline chain too short to close — dropped")
+    for ring in islets:
+        hole = [[round(x, 3), round(y, 3)] for x, y in ring]
+        if signed_area(hole) > 0:
+            hole = hole[::-1]                  # holes are CW (earcut order)
+        cxy = (sum(p[0] for p in hole) / len(hole),
+               sum(p[1] for p in hole) / len(hole))
+        for e in buildable:
+            if point_in_poly(cxy[0], cxy[1], e["outer"]):
+                e["holes"].append(hole)
+                break
+        else:
+            notes.append("coastline islet not inside any sea polygon "
+                         "— dropped")
+    for ring, origin in water_rings:
+        outer = ensure_ccw([[round(x, 3), round(y, 3)] for x, y in ring])
+        if any(abs(p[k]) > half + 1e-9 for p in outer for k in (0, 1)):
+            outer = _sh_clip_ring(outer, half)   # keep the in-rect part
+        if len(outer) < 3 or signed_area(outer) <= 0:
+            notes.append(f"{origin}: degenerate after rect clip — dropped")
+            continue
+        buildable.append({"kind": "water", "origin": origin,
+                          "outer": outer, "holes": []})
+
+    entries = []
+    for e in buildable:
+        e["area_m2"] = round(signed_area(e["outer"])
+                             + sum(signed_area(h) for h in e["holes"]), 1)
+        if e["area_m2"] < WATER_MIN_AREA_M2:
+            notes.append(f"{e['origin']}: polygon smaller than the "
+                         f"{WATER_MIN_AREA_M2:.0f} m2 floor — dropped")
+            continue
+        e["id"] = f"w{len(entries)}"
+        entries.append(e)
+    return entries, notes
 
 
 # ---- pack assembly -----------------------------------------------------------
@@ -1014,6 +1420,25 @@ def write_obj(pack, path, height=None):
         w.end()
     for t in pack["trees"]:
         _add_tree(w, t, _z_at(height, (t["x"], t["y"]), 0.0))
+    for k, wtr in enumerate(pack.get("water", [])):
+        z = WATER_Z_BASE + WATER_Z_STAGGER * k
+        w.begin("water_" + wtr["id"], "water")
+        # The drawn fill: holes stitched into the outer as a keyhole ring
+        # (duplicated bridge vertices); triangulate_ring accepts ears that
+        # touch a vertex equal to one of their own, so the clipper makes
+        # progress through the doubled corridor. Unbridgeable holes stay in
+        # the pack's holes[] (the area identity keeps counting them); only
+        # the drawn fill loses them.
+        ring, dropped = _bridge_holes(wtr["outer"], wtr["holes"])
+        if dropped:
+            print(f"water: {wtr['id']}: {len(dropped)} hole(s) have no "
+                  f"visible outer vertex - kept in holes[], not drawn",
+                  file=sys.stderr)
+        for i0, i1, i2 in triangulate_ring(ring):
+            w.add([(ring[i0][0], ring[i0][1], _z_at(height, ring[i0], z)),
+                   (ring[i1][0], ring[i1][1], _z_at(height, ring[i1], z)),
+                   (ring[i2][0], ring[i2][1], _z_at(height, ring[i2], z))])
+        w.end()
     w.write(path)
 
 
@@ -1138,11 +1563,14 @@ def validate_pack(pack_dir):
     strips = pack.get("strips", [])
     grass = pack.get("grass", [])
     trees = pack.get("trees", [])
+    water = pack.get("water", [])
     counts = pack.get("counts", {})
     for key, arr in (("buildings", buildings), ("roads", roads),
                      ("strips", strips), ("grass", grass), ("trees", trees)):
         if counts.get(key) != len(arr):
             err(f"counts.{key} {counts.get(key)} != {len(arr)}")
+    if counts.get("water", 0) != len(water):
+        err(f"counts.water {counts.get('water', 0)} != {len(water)}")
     if counts.get("trees_tagged") != sum(
             1 for t in trees if t.get("source") == "tagged"):
         err("counts.trees_tagged != tagged tree count")
@@ -1152,7 +1580,9 @@ def validate_pack(pack_dir):
             1 for r in roads if r.get("width_m") >= DASH_MIN_WIDTH):
         err("counts.dashes != width>=5.0 road count")
 
-    # bounds and span, recomputed from the rounded coordinates
+    # bounds and span, recomputed from the rounded coordinates. Water points
+    # are deliberately excluded: the clip box derives from span, so water
+    # points outside span would make span's clip box self-referential.
     pts = [p for b in buildings for p in b["ring"]]
     pts += [p for r in roads for p in r["polyline"]]
     pts += [p for s in strips for p in s["polyline"]]
@@ -1230,7 +1660,39 @@ def validate_pack(pack_dir):
         if t.get("source") not in ("tagged", "scattered"):
             err(f"{t.get('id')}: source {t.get('source')!r}")
         ids.add(t.get("id"))
-    if len(ids) != len(buildings) + len(roads) + len(strips) + len(grass) + len(trees):
+    # Water entries: orientation conventions, area identity, floor. The
+    # identity is computed from the ROUNDED rings, matching how the pack
+    # tool derived area_m2, so validator and tool agree exactly.
+    for wtr in water:
+        outer = wtr.get("outer", [])
+        if len(outer) < 3:
+            err(f"{wtr.get('id')}: outer < 3 pts")
+            continue
+        if signed_area(outer) <= 0:
+            err(f"{wtr.get('id')}: outer not CCW")
+        holes = wtr.get("holes", [])
+        for hole in holes:
+            if len(hole) < 3:
+                err(f"{wtr.get('id')}: hole < 3 pts")
+                continue
+            if signed_area(hole) >= 0:
+                err(f"{wtr.get('id')}: hole not CW")
+        area = (signed_area(outer)
+                + sum(signed_area(h) for h in holes))
+        if abs(wtr.get("area_m2", -1.0) - area) > 0.5:
+            err(f"{wtr.get('id')}: area_m2 {wtr.get('area_m2')} != "
+                f"{round(area, 1)}")
+        if wtr.get("kind") not in ("sea", "water"):
+            err(f"{wtr.get('id')}: kind {wtr.get('kind')!r}")
+        if not wtr.get("id"):
+            err("water entry missing id")
+        if not wtr.get("origin"):
+            err(f"{wtr.get('id')}: origin missing")
+        if wtr.get("area_m2", 0.0) < WATER_MIN_AREA_M2:
+            err(f"{wtr.get('id')}: area below the {WATER_MIN_AREA_M2} m2 floor")
+        ids.add(wtr.get("id"))
+    if len(ids) != (len(buildings) + len(roads) + len(strips) + len(grass)
+                    + len(trees) + len(water)):
         err("duplicate ids")
 
     # cross-check the OBJ group counts against the JSON
@@ -1271,6 +1733,7 @@ def validate_pack(pack_dir):
             "tree": len(trees),
             "treec": len(trees),
             "dash": counts.get("dashes", 0),
+            "water": len(water),
         }
         for name, want in want_groups.items():
             if groups.get(name, 0) != want:
@@ -1430,38 +1893,62 @@ def _is_3dec(tok):
 def fetch_osm(lat, lon, radius_m, cache_path):
     """Fetch the broad element set around (lat, lon) from Overpass.
 
-    Buildings + highways + barriers + grass/garden + tree nodes — the same
-    breadth the cached fixture was probed with (the source's building-only
-    query cannot build a scene). Returns (data, endpoint_used, date_iso).
+    Buildings + highways + barriers + grass/garden + tree nodes + the water
+    rung's coastline/inland-water ways — the same breadth the cached fixture
+    was probed with (the source's building-only query cannot build a scene).
+    Returns (data, endpoint_used, date_iso). 504s/timeouts are routine: each
+    endpoint gets two tries with a pause between, and the loop moves down the
+    endpoint list before giving up.
     """
     r_deg = radius_m / M_PER_DEG_LAT
     bbox = (lat - r_deg, lon - r_deg * 1.6, lat + r_deg, lon + r_deg * 1.6)  # S,W,N,E
     query = (f"[out:json][timeout:120];"
-             f'(way["building"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
-             f'way["highway"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
-             f'way["barrier"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
-             f'way["landuse"~"^(grass|meadow)$"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
-             f'way["leisure"="garden"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
-             f'node["natural"="tree"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
-             f");out geom;")
-    url = OVERPASS_URL + "?" + urllib.parse.urlencode({"data": query})
-    print(f"osm: fetching {radius_m:.0f} m radius from overpass-api.de ...")
-    try:
-        with urllib.request.urlopen(url, timeout=120) as resp:
-            raw = resp.read()
-        endpoint = OVERPASS_URL
-    except urllib.error.HTTPError as e:
-        mirror = MIRROR_URL + "?" + urllib.parse.urlencode({"data": query})
-        print(f"osm: primary endpoint failed ({e}), trying kumi mirror")
-        with urllib.request.urlopen(mirror, timeout=120) as resp:
-            raw = resp.read()
-        endpoint = MIRROR_URL
+                 f'(way["building"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["highway"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["barrier"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["landuse"~"^(grass|meadow)$"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["leisure"="garden"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'node["natural"="tree"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["natural"="coastline"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["natural"="water"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["landuse"="reservoir"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f'way["waterway"~"^(riverbank|dock)$"]({bbox[0]:.7f},{bbox[1]:.7f},{bbox[2]:.7f},{bbox[3]:.7f});'
+                 f");out geom;")
+    last_err = None
+    print(f"osm: fetching {radius_m:.0f} m radius around "
+          f"({lat:.4f}, {lon:.4f}); endpoints: overpass-api.de, kumi, maps.mail.ru")
+    for url in (OVERPASS_URL, MIRROR_URL, MAILRU_URL):
+        for try_no in (0, 1):
+            try:
+                with urllib.request.urlopen(
+                        url + "?" + urllib.parse.urlencode({"data": query}),
+                        timeout=120) as resp:
+                    raw = resp.read()
+                endpoint = url
+                break
+            except OSError as e:          # HTTPError/URLError/TimeoutError
+                last_err = e
+                print(f"osm: {url} try {try_no}: {e}", file=sys.stderr)
+                if try_no == 0:
+                    time.sleep(TRY_SLEEP_S)
+        else:
+            continue
+        break
+    else:
+        raise SystemExit(f"osm: all Overpass endpoints failed "
+                         f"(last error: {last_err})")
     data = json.loads(raw)
     if cache_path:
         with open(cache_path, "w") as f:
             json.dump(data, f)
         print(f"osm: cache written to {cache_path}")
     sha = hashlib.sha256(raw).hexdigest()
+    kinds = {}
+    for el in data.get("elements", []):
+        kinds[el.get("type")] = kinds.get(el.get("type"), 0) + 1
+    print(f"osm: fetched {len(data.get('elements', []))} elements "
+          f"({kinds.get('way', 0)} ways, {kinds.get('node', 0)} nodes) "
+          f"from {url}")
     return data, endpoint, datetime.date.today().isoformat(), sha
 
 
@@ -1520,7 +2007,8 @@ def main(argv=None):
         src_sha = ""
 
     scene = parse_scene(data, args.lat, args.lon, args.seed)
-    classified, roads, strips, grass, trees, tree_params, n_tagged = scene
+    (classified, roads, strips, grass, trees, tree_params, n_tagged,
+     coast_open, coast_closed, water_rings) = scene
     pack = build_pack(classified, roads, strips, grass, trees, tree_params,
                       n_tagged, args.lat, args.lon, args.seed, src_sha, fetched)
 
@@ -1557,6 +2045,15 @@ def main(argv=None):
         for t in grid["tiles"]:
             print(f"terrain tile: {t['name']} sha256 {t['sha256'][:12]}...")
 
+    water, water_notes = solve_water(coast_open, coast_closed,
+                                     water_rings, pack["ground"]["span_m"] / 2.0)
+    for note in water_notes:
+        print(f"water: {note}", file=sys.stderr)
+    if water:
+        pack["water"] = water
+        pack["counts"]["water"] = len(water)
+        print(f"water: {len(water)} polygon(s) draped above the ground")
+
     os.makedirs(args.out, exist_ok=True)
     pack_path = os.path.join(args.out, "pack.json")
     with open(pack_path, "w") as f:
@@ -1566,11 +2063,13 @@ def main(argv=None):
     write_obj(pack, obj_path, height=(grid["h"] if grid is not None else None))
 
     c = pack["counts"]
+    water_txt = f", {c['water']} water" if c.get("water") else ""
     print(f"pack: {args.out} ({os.path.getsize(pack_path) / 1e6:.1f} MB json, "
           f"{os.path.getsize(obj_path) / 1e6:.1f} MB obj): "
           f"{c['buildings']} buildings, {c['trees']} trees "
           f"({n_tagged} tagged + {c['trees'] - n_tagged} scattered), "
-          f"{c['roads']} roads, {c['strips']} hedges/fences, {c['grass']} grass, "
+          f"{c['roads']} roads, {c['strips']} hedges/fences, "
+          f"{c['grass']} grass{water_txt}, "
           f"span {pack['ground']['span_m']:.0f} m")
     if pack["origin_inside_building"]:
         print("WARNING: origin (0,0) inside a building footprint — pick "

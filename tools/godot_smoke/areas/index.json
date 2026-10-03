@@ -2,7 +2,7 @@
   "schema": "darter_areas",
   "version": 1,
   "attribution": "© OpenStreetMap contributors, ODbL 1.0 | © Copernicus DEM / ESA (GLO-30)",
-  "notes": "city/coast/hills OSM fetched 2026-10-03 through maps.mail.ru (overpass-api.de and other instances 406/504'd that day); coast origin nudged from Calshot Spit to the Stone shore (spit is unmapped); hills origin nudged 318 m S / 163 m E of Butser Hill so the 4530 m DEM grid stays inside tile N50_00_W001_00. suburb = the pre-existing home-area fixtures (OSM base 2026-06-01, DEM tile fetched 2026-10-01). Coast water renders as draped ground; sea water itself is a later rung.",
+  "notes": "city/coast/hills OSM fetched 2026-10-03 through maps.mail.ru (overpass-api.de and other instances 406/504'd that day); coast origin nudged from Calshot Spit to the Stone shore (spit is unmapped); hills origin nudged 318 m S / 163 m E of Butser Hill so the 4530 m DEM grid stays inside tile N50_00_W001_00. suburb = the pre-existing home-area fixtures (OSM base 2026-06-01, DEM tile fetched 2026-10-01). Coast sea paints as water from the mapped coastline (islets stay land); the refetch that carries the coastline ways is 2026-10-03 too.",
   "areas": [
     {
       "name": "city",
@@ -53,7 +53,7 @@
     {
       "name": "coast",
       "title": "Coast",
-      "description": "Stone sea front on Southampton Water: village, shingle, sea as draped ground this release.",
+      "description": "Stone sea front on Southampton Water: village, shingle, sea painted as water around the mapped islets.",
       "lat": 50.8130,
       "lon": -1.3070,
       "seed": 13,
@@ -61,13 +61,13 @@
       "track": "track.json",
       "inputs": {
         "osm": "osm_coast.json",
-        "osm_sha256": "21dfdcca691bfc102efb135427aff3fffa9aefcc97def1f215bc076534da469e",
+        "osm_sha256": "d22680be8978f761e140eefe110d2cf4d52299813d96378309276549417eda29",
         "dem": "dem_coast.tif",
         "dem_sha256": "84d3ce38735ea9b36ef1d9af374c0b500d422fa311f8e1aa6e6015e8dfa54168",
         "glo30_tile": "N50_00_W002_00",
         "full_tile_sha256": "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134"
       },
-      "counts": {"buildings": 162, "roads": 22, "strips": 1, "grass": 6, "trees": 412},
+      "counts": {"buildings": 162, "roads": 22, "strips": 1, "grass": 6, "trees": 412, "water": 2},
       "relief": {"z_min": -1.7, "z_max": 16.6},
       "span_m": 1950.0,
       "fetched": {"date": "2026-10-03", "endpoint": "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "radius_m": 700},
