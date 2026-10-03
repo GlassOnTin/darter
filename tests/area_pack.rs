@@ -571,6 +571,230 @@ fn area_pack_validator_rejects_terrain_corruption() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+// ---- curated demo-area fixtures (VISION pillar 3: city/suburb/coast/hills) ----
+//
+// Three new fixture pairs fetched 2026-10-03 (Overpass caches from the named
+// endpoints, tools/area_pack.py:67-68) and GLO-30 clips cut from the cached
+// full tiles by tools/cut_dem.py in the dem_home_area.tif style. Per-area
+// relief and counts are dated measurements from THESE bytes; any re-fetch or
+// re-clip changes the shas and fails here by design.
+//
+// Each pair drives a full offline glo30 pack build (validator green) whose
+// terrain.bin was checked byte-equal against a full-tile build cut from the
+// same cache (S1 evidence, recorded in the commit message) — the committed
+// clip covers every sampled node.
+
+struct DemoArea {
+    name: &'static str,
+    lat: f64,
+    lon: f64,
+    seed: u64,
+    /// sha256 of the committed osm_<name>.json bytes
+    osm_sha256: &'static str,
+    /// sha256 of the committed dem_<name>.tif bytes
+    dem_sha256: &'static str,
+    /// sha256 of the source GLO-30 tile (from the clip's provenance)
+    full_tile_sha256: &'static str,
+    /// the clip's source tile (must appear in the provenance sentence)
+    glo30_tile: &'static str,
+    min_elements: usize,
+    min_buildings: usize,
+    min_roads: usize,
+    z_min: f64,
+    z_max: f64,
+    min_span_m: f64,
+}
+
+// Pin table for the 2026-10-03 fetches. All three went through the maps.mail.ru
+// Overpass instance (0.7.62.4, data timestamp 2026-10-03) — both named endpoints
+// in fetch_osm 406'd/504'd fleet-wide that day; the real endpoint is recorded
+// honestly in tools/godot_smoke/areas/index.json at S3.
+// Dated origin nudges (plan risk 4, one per area): coast Calshot Spit ->
+// Stone shore (50.8130,-1.3070; the spit shingle is unmapped, the village west
+// of it is); hills Butser -> (50.9761,-0.9457), 318 m S / 163 m E of the plan
+// pin, so the 4530 m grid stays fully inside tile N50_00_W001_00 and one
+// committed clip covers every node.
+const DEMO_AREAS: &[DemoArea] = &[
+    DemoArea { name: "city",  lat: 50.9060, lon: -1.4012, seed: 11, osm_sha256: "84d5a655f5507e639dba5ab08cf8e7b110c238d3352d466622b1f6c146d170a8", dem_sha256: "44f286eba288248851253c760d463f90d4920b2164225b968105d333be7282d0", full_tile_sha256: "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134", glo30_tile: "N50_00_W002_00", min_elements: 3793, min_buildings: 1740, min_roads: 1488, z_min: -2.8, z_max: 36.9, min_span_m: 2190.0 },
+    DemoArea { name: "coast", lat: 50.8130, lon: -1.3070, seed: 13, osm_sha256: "21dfdcca691bfc102efb135427aff3fffa9aefcc97def1f215bc076534da469e", dem_sha256: "84d3ce38735ea9b36ef1d9af374c0b500d422fa311f8e1aa6e6015e8dfa54168", full_tile_sha256: "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134", glo30_tile: "N50_00_W002_00", min_elements: 191, min_buildings: 162, min_roads: 22, z_min: -1.7, z_max: 16.6, min_span_m: 1950.0 },
+    DemoArea { name: "hills", lat: 50.9761, lon: -0.9457, seed: 17, osm_sha256: "e226352c4583c938fb7345e0c377dd85646e399ccd6f9c22b474a891132bfb49", dem_sha256: "870d4f9318b7047c11d2eabd246ae0c5dbb9e93c3012517bf75150e7af435884", full_tile_sha256: "09609412e26651cfdc4ccf0e336f66581f4af64145670a11aae13848c7429c6d", glo30_tile: "N50_00_W001_00", min_elements: 304, min_buildings: 143, min_roads: 133, z_min: -94.2, z_max: 124.9, min_span_m: 4530.0 },
+];
+
+#[test]
+fn demo_area_fixtures_inputs() {
+    for a in DEMO_AREAS {
+        let osm_path = format!("tests/fixtures/osm_{}.json", a.name);
+        let dem_path = format!("tests/fixtures/dem_{}.tif", a.name);
+        assert!(
+            Path::new(&osm_path).exists(),
+            "missing fixture {osm_path}: run the S1 fetch first"
+        );
+        assert!(
+            Path::new(&dem_path).exists(),
+            "missing fixture {dem_path}: cut it with tools/cut_dem.py"
+        );
+
+        // bytes pinned: any re-fetch or re-clip fails here
+        let osm_bytes = std::fs::read(&osm_path).expect("read overpass fixture");
+        let mut h = darter_core::sha256::Sha256::new();
+        h.update(&osm_bytes);
+        assert_eq!(
+            darter_core::sha256::to_hex(&h.finish()),
+            a.osm_sha256,
+            "osm_{}.json drifted from the 2026-10-03 pin",
+            a.name
+        );
+        let dem_bytes = std::fs::read(&dem_path).expect("read dem clip");
+        let mut h = darter_core::sha256::Sha256::new();
+        h.update(&dem_bytes);
+        assert_eq!(
+            darter_core::sha256::to_hex(&h.finish()),
+            a.dem_sha256,
+            "dem_{}.tif drifted from the 2026-10-03 pin",
+            a.name
+        );
+
+        // the Overpass cache parses and has the measured breadth
+        let data: serde_json::Value =
+            serde_json::from_slice(&osm_bytes).expect("overpass json parse");
+        let elements = data
+            .get("elements")
+            .and_then(|v| v.as_array())
+            .expect("overpass elements array");
+        assert!(
+            elements.len() >= a.min_elements,
+            "{osm_path}: {} elements below dated floor {}",
+            elements.len(),
+            a.min_elements
+        );
+        let buildings = elements
+            .iter()
+            .filter(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("way")
+                    && e.get("tags")
+                        .and_then(|v| v.get("building"))
+                        .is_some()
+            })
+            .count();
+        assert!(
+            buildings >= a.min_buildings,
+            "{osm_path}: {} building ways below dated floor {}",
+            buildings,
+            a.min_buildings
+        );
+        let roads = elements
+            .iter()
+            .filter(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("way")
+                    && e.get("tags")
+                        .and_then(|v| v.get("highway"))
+                        .is_some()
+            })
+            .count();
+        assert!(
+            roads >= a.min_roads,
+            "{osm_path}: {} highway ways below dated floor {}",
+            roads,
+            a.min_roads
+        );
+
+        // clip provenance sentence (ImageDescription, raw byte search)
+        let raw = String::from_utf8_lossy(&dem_bytes);
+        assert!(
+            raw.contains("darter DEM clip"),
+            "dem_{}.tif: provenance sentence missing",
+            a.name
+        );
+        assert!(
+            raw.contains(a.glo30_tile),
+            "dem_{}.tif: provenance must name the source tile {}",
+            a.name,
+            a.glo30_tile
+        );
+        assert!(
+            raw.contains(a.full_tile_sha256),
+            "dem_{}.tif: provenance must carry the full-tile sha256",
+            a.name
+        );
+
+        // offline build from the committed pair + the tool's own validator
+        let dir = temp_dir(&format!("demo-{}", a.name));
+        let (ok, stdout, stderr) = run({
+            let mut c = tool();
+            c.args([
+                "--osm",
+                &osm_path,
+                "--lat",
+                &a.lat.to_string(),
+                "--lon",
+                &a.lon.to_string(),
+                "--seed",
+                &a.seed.to_string(),
+                "--elevation",
+                "glo30",
+                "--dem-file",
+                &dem_path,
+                "--out",
+            ])
+            .arg(&dir);
+            c
+        });
+        assert!(ok, "{} build failed: {stdout}{stderr}", a.name);
+        let (ok, _out, err) = validate(&dir);
+        assert!(ok, "::validator rejected the {} pack: {err}", a.name);
+
+        let text = read_pack_text(&dir);
+        assert_eq!(str_in(&text, "schema"), "darter_area_pack");
+        assert!((num_in(&text, "version") - 3.0).abs() < f64::EPSILON);
+        assert!(str_in(&text, "attribution").contains("OpenStreetMap"));
+        assert!(str_in(&text, "attribution").contains("Copernicus DEM"));
+        assert!((num_in(&text, "seed") - a.seed as f64).abs() < f64::EPSILON);
+        assert!((num_in(&text, "origin_lat") - a.lat).abs() < 1e-9);
+        assert!((num_in(&text, "origin_lon") - a.lon).abs() < 1e-9);
+        // input sha equals the committed fixture bytes (same path as
+        // assert_common_metadata's check)
+        assert_eq!(str_in(&text, "osm_json_sha256"), a.osm_sha256);
+        assert!(
+            text.contains("\"origin_inside_building\": false"),
+            "{}: origin inside a building",
+            a.name
+        );
+
+        // elevation block: the dated relief pins + the snap identity
+        let elevation = json_object(&text, "elevation");
+        assert_eq!(str_in(elevation, "model"), "glo30");
+        assert_eq!(str_in(elevation, "datum"), "origin_ground");
+        assert!((num_in(elevation, "step_m") - 30.0).abs() < f64::EPSILON);
+        let z_min = num_in(elevation, "z_min");
+        let z_max = num_in(elevation, "z_max");
+        assert!(
+            (z_min - a.z_min).abs() <= 0.05 && (z_max - a.z_max).abs() <= 0.05,
+            "{}: relief {z_min}..{z_max} vs pinned {}..{}",
+            a.name,
+            a.z_min,
+            a.z_max
+        );
+        let cols = num_in(elevation, "cols") as usize;
+        let rows = num_in(elevation, "rows") as usize;
+        let stored = num_in(&text, "span_m");
+        assert!(
+            (stored - (cols - 1) as f64 * 30.0).abs() < 0.001,
+            "{}: span {} != snapped (cols-1)*30.0",
+            a.name,
+            stored
+        );
+        assert!(stored >= a.min_span_m, "{}: span {stored} below floor", a.name);
+
+        // sidecar: exact size + datum node 0
+        let bin = std::fs::read(dir.join("terrain.bin")).expect("terrain.bin");
+        assert_eq!(bin.len(), 56 + 8 * cols * rows, "{}: terrain.bin size", a.name);
+        let z00 = f64::from_le_bytes(bin[56..64].try_into().expect("8 bytes"));
+        assert!((z00 - 0.0).abs() < f64::EPSILON, "{}: datum node not 0.0", a.name);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// loose — remote content is not pinned — but the fetch must produce a
 /// pack that validates, with the fetch date and endpoint recorded.
 #[test]
