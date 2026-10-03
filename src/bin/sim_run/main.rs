@@ -52,9 +52,6 @@ use darter_core::terrain::{Ground, TerrainGrid};
 use darter_core::wind::{WindConfig, WindModel};
 use darter_core::DVec3;
 
-// Wired into the CLI in the next commit (--track); dead_code silences the
-// unused-module warnings in the interim.
-#[allow(dead_code)]
 mod track;
 
 const SUBSTEP_DT: f64 = 125e-6; // 8 kHz core step
@@ -133,6 +130,11 @@ struct Args {
     /// the record convention. None = flat ground at z = 0. A missing or bad
     /// file is a hard error, never a silent flat fallback.
     terrain: Option<String>,
+    /// Path to a darter_track JSON (schema v1, see file track.rs): the flown
+    /// record is evaluated post-hoc against the gate planes and the events
+    /// land in summary.json. A missing or bad file is a hard error before
+    /// anything flies. None = no track evaluation.
+    track: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -163,6 +165,7 @@ fn parse_args() -> Result<Args, String> {
         roll_until: f64::INFINITY,
         gps_stale: false,
         terrain: None,
+        track: None,
     };
     // Set when the --sensors spec pinned a seed, so a bare --sensors follows
     // the run seed (same --seed reproduces the same noise stream).
@@ -208,6 +211,7 @@ fn parse_args() -> Result<Args, String> {
             "--determinism-check" => a.determinism_check = true,
             "--gps-stale" => a.gps_stale = true,
             "--terrain" => a.terrain = Some(val("terrain")?),
+            "--track" => a.track = Some(val("track")?),
             s if s == "--wind" || s.starts_with("--wind=") => {
                 // Bare --wind: standard weather (mean calm, W20 moderate).
                 let mut cfg = WindConfig {
@@ -305,6 +309,19 @@ struct TerrainInfo {
     sha256: String,
 }
 
+/// Provenance + results for the track, when one was evaluated
+/// (summary.json only). Events are computed post-hoc from the written
+/// record — physics never sees the track.
+struct TrackInfo {
+    path: String,
+    sha256: String,
+    name: String,
+    is_loop: bool,
+    n_cps: usize,
+    events: Vec<(usize, f64)>,
+    lap_splits: Option<Vec<f64>>,
+}
+
 struct RunOutcome {
     record_hash: u64,
     ticks: usize,
@@ -330,6 +347,8 @@ struct RunOutcome {
     sitl: Option<SitlInfo>,
     /// Set only when the run flew with a terrain grid (`--terrain`).
     terrain: Option<TerrainInfo>,
+    /// Set only when the run evaluated a track (`--track`).
+    track: Option<TrackInfo>,
 }
 
 fn run() -> Result<(), String> {
@@ -358,6 +377,27 @@ fn run() -> Result<(), String> {
         }
         None => (None, None),
     };
+    // Same load-before-fly contract for the track file. It feeds only the
+    // post-hoc event evaluation below — physics and record bytes never see
+    // it, so --track cannot change a flight.
+    let (track, track_prov) = match &args.track {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("track {path}: read: {e}"))?;
+            let t = track::parse(&bytes).map_err(|e| format!("track {path}: {e}"))?;
+            println!(
+                "[sim_run] track {path}: \"{}\", {} checkpoints, {}, spawn {}",
+                t.name,
+                t.cps.len(),
+                if t.is_loop { "loop" } else { "open" },
+                match t.spawn {
+                    Some([x, y, z]) => format!("({x:.1}, {y:.1}, {z:.1})"),
+                    None => "none".to_string(),
+                }
+            );
+            (Some(t), Some((path.clone(), sha256_hex(&bytes))))
+        }
+        None => (None, None),
+    };
 
     let mut outcome = match args.mode.as_str() {
         "core" => {
@@ -380,6 +420,27 @@ fn run() -> Result<(), String> {
     outcome.terrain = terrain_info;
 
     let out_dir = PathBuf::from(&args.out);
+    // Events are computed post-hoc from the written record — with
+    // --determinism-check only flight.jsonl is measured (flight2.jsonl is
+    // written, evaluated, hashed, and its data discarded for output).
+    if let Some(t) = &track {
+        let (path, sha256) = track_prov.expect("track provenance held alongside the flight");
+        let rows = track::read_record_positions(&out_dir.join("flight.jsonl"))
+            .map_err(|e| format!("track {path}: {e}"))?;
+        let (events, splits) = track::compute_events(t, &rows);
+        outcome.track = Some(TrackInfo {
+            path,
+            sha256,
+            name: t.name.clone(),
+            is_loop: t.is_loop,
+            n_cps: t.cps.len(),
+            events,
+            // Open tracks report no laps at all (null); a loop reports an
+            // array, which is empty on a one-way transit with a single
+            // start crossing.
+            lap_splits: if t.is_loop { Some(splits) } else { None },
+        });
+    }
     write_summary(&out_dir, &args, &outcome)?;
     println!(
         "[sim_run] done: {} ticks in {:.2}s wall, record hash {:016x}, final alt {:.3} m, p99 loop {:.2} ms",
@@ -505,6 +566,7 @@ fn run_core(
         wind: args.wind_cfg.is_some(),
         sitl: None,
         terrain: None,
+        track: None,
     })
 }
 
@@ -791,6 +853,7 @@ fn fly_closed(
             wind: args.wind_cfg.is_some(),
             sitl: Some(sitl_info),
             terrain: None,
+            track: None,
         }
     })
 }
@@ -1035,6 +1098,7 @@ fn pct(sorted: &[f64], q: f64) -> f64 {
 /// summary.json: run facts, provenance, and the quantitative acceptance
 /// numbers. Hand-formatted like the record (fixed field order).
 fn write_summary(out_dir: &Path, args: &Args, o: &RunOutcome) -> Result<(), String> {
+    let have_track = o.track.is_some();
     let mut s = String::with_capacity(2048);
     s.push_str("{\n");
     s.push_str(&format!("  \"mode\": \"{}\",\n", args.mode));
@@ -1091,12 +1155,12 @@ fn write_summary(out_dir: &Path, args: &Args, o: &RunOutcome) -> Result<(), Stri
             "    \"profile_readback_ok\": {}\n",
             sitl.profile_readback_ok
         ));
-        if o.terrain.is_some() {
+        if o.terrain.is_some() || have_track {
             s.push_str("  },\n");
         } else {
             s.push_str("  }\n");
         }
-    } else if o.terrain.is_none() {
+    } else if o.terrain.is_none() && !have_track {
         // Trim the trailing comma from the status_samples line.
         if s.ends_with("],\n") {
             s.pop();
@@ -1108,6 +1172,49 @@ fn write_summary(out_dir: &Path, args: &Args, o: &RunOutcome) -> Result<(), Stri
         s.push_str("  \"terrain\": {\n");
         s.push_str(&format!("    \"path\": \"{}\",\n", json_escape(&terr.path)));
         s.push_str(&format!("    \"sha256\": \"{}\"\n", json_escape(&terr.sha256)));
+        // The track block always follows when present, so the terrain
+        // object closes with a comma for it. The comma lives on the close
+        // line only — the last key line must never carry a trailing comma.
+        if have_track {
+            s.push_str("  },\n");
+        } else {
+            s.push_str("  }\n");
+        }
+    }
+    if let Some(trk) = &o.track {
+        s.push_str("  \"track\": {\n");
+        s.push_str(&format!(
+            "    \"schema\": \"darter_track\", \"version\": 1, \"name\": \"{}\", \"path\": \"{}\",\n",
+            json_escape(&trk.name),
+            json_escape(&trk.path)
+        ));
+        s.push_str(&format!(
+            "    \"sha256\": \"{}\", \"checkpoints\": {}, \"loop\": {},\n",
+            json_escape(&trk.sha256),
+            trk.n_cps,
+            trk.is_loop
+        ));
+        s.push_str("    \"events\": [");
+        for (i, (idx, t)) in trk.events.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("[{}, {:.3}]", idx, t));
+        }
+        s.push_str("], ");
+        match &trk.lap_splits {
+            Some(splits) => {
+                s.push_str("\"lap_splits\": [");
+                for (i, t) in splits.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&format!("{:.3}", t));
+                }
+                s.push_str("]\n");
+            }
+            None => s.push_str("\"lap_splits\": null\n"),
+        }
         s.push_str("  }\n");
     }
     s.push_str("}\n");
