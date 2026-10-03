@@ -20,6 +20,12 @@
 //!   Fog grey and sky blue both land in "sky"/"man-made" by colour — that is
 //!   why the vegetation gate carries the empty-scene regression, not the
 //!   man-made one;
+//! - cost ceilings hold the chunked loader's shape (one ArrayMesh per 64 m
+//!   grid cell so Godot's per-instance frustum cull drops off-frame chunks):
+//!   the per-area pr_mean ceiling is the pre-chunk monolith mean halved — a
+//!   regression to the monolith or a whole-chunk cull failure climbs past
+//!   it — and the dr_p95 ceiling is the chunked measured p95 doubled — a
+//!   cell-binning blow-up climbs past it (2026-10-03);
 //! - a second full run must reproduce the deterministic projection exactly
 //!   (positions, brightness, and the class fractions — all derived from the
 //!   record + the byte-identical pack; wall-clock frame deltas excluded).
@@ -111,8 +117,12 @@ struct Sample {
     mm: f64,
     du: u64,
     /// Render primitives in the last completed frame (measurement only —
-    /// canon() excludes it; the M1 relief growth is measured against it).
+    /// canon() excludes it; the M1 relief growth is measured against it and
+    /// the chunk-culling cost gate pins it from above).
     pr: u64,
+    /// Draw calls in the last completed frame (measurement only — canon()
+    /// excludes it; the chunk-culling cost gate pins its tail from above).
+    dr: u64,
 }
 
 /// The deterministic projection for the determinism gate. du is wall-clock
@@ -162,6 +172,7 @@ fn parse_replay(path: &Path) -> (usize, Vec<Sample>, PackSummary) {
             mm: num(e, "mm"),
             du: num(e, "du") as u64,
             pr: num(e, "pr") as u64,
+            dr: num(e, "dr") as u64,
         });
     }
     let frames = num(&text[..i], "frames") as usize;
@@ -210,17 +221,66 @@ const CORRIDOR_FLOORS: PixelFloors = PixelFloors {
     min_mm: 0.10,
 };
 
-/// T7's wrapper: signature and corridor numbers unchanged.
+/// Per-area render-cost ceilings (chunk-culling rung, 2026-10-03): the pack
+/// loader bins faces into one ArrayMesh per 64 m grid cell so Godot's
+/// per-instance frustum cull drops whole cells off-frame. That trades draw
+/// calls (dr, up ~25-50x) for primitives actually rendered (pr, down
+/// 61-86%). Like du, both are performance measurements — canon() excludes
+/// them — but the trade itself is the rung's design, so both are pinned:
+///
+/// - pr_mean: the PRE-chunk monolith's measured mean, halved. A regression
+///   to the monolith (or a whole-chunk cull failure) climbs back toward the
+///   full pre value and cannot pass; the chunked canon sits far under (city
+///   -81.2%, suburb -85.8%, coast -61.4%, hills -74.4%).
+/// - dr_p95: the chunked canon's measured p95, doubled. A cell-size or
+///   binning bug that multiplies cells/surfaces blows past it (no dr floor:
+///   losing chunking inflates pr, which the first ceiling catches).
+///
+/// A future rung that legitimately adds geometry (e.g. a distance-swap
+/// rung) re-baselines these from its own measured canon, as S1-S5
+/// re-baselined the floors.
+#[derive(Clone, Copy, Debug)]
+struct CostCeils {
+    pr_mean: u64,
+    dr_p95: u64,
+}
+
+const CITY_COST: CostCeils = CostCeils {
+    pr_mean: 330741, // pre-chunk mean 661481 / 2; chunked measured 124672 (p95 186625)
+    dr_p95: 3986,    // chunked measured p95 1993, doubled
+};
+
+const CORRIDOR_COST: CostCeils = CostCeils {
+    // Corridor == suburb (byte-identical pack + record per gate (e)):
+    // pre-chunk pr mean 502591, chunked measured 71276 (p95 103365).
+    pr_mean: 251296,
+    dr_p95: 7696, // chunked measured p95 3848, doubled
+};
+
+const COAST_COST: CostCeils = CostCeils {
+    pr_mean: 70441, // pre-chunk mean 140882 / 2; chunked measured 54415 (p95 79264)
+    dr_p95: 1714,   // chunked measured p95 857, doubled
+};
+
+const HILLS_COST: CostCeils = CostCeils {
+    pr_mean: 240644, // pre-chunk mean 481288 / 2; chunked measured 123130 (p95 150982)
+    dr_p95: 6616,    // chunked measured p95 3308, doubled
+};
+
+/// T7's wrapper: signature and corridor numbers unchanged (cost too —
+/// the corridor record pack is the suburb bytes).
 fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<String, String> {
-    validate_with(replay, record_rows, CORRIDOR_FLOORS)
+    validate_with(replay, record_rows, CORRIDOR_FLOORS, CORRIDOR_COST)
 }
 
 /// The parameterized core (T8's demo areas fly different scenes; each area
-/// carries its own measured floors in the AREAS table, pinned at S5).
+/// carries its own measured floors and cost ceilings in the AREAS table,
+/// pinned at S5 / the chunk-culling rung).
 fn validate_with(
     replay: &Path,
     record_rows: &[(f64, f64, f64, f64)],
     floors: PixelFloors,
+    cost: CostCeils,
 ) -> Result<String, String> {
     let (frames, samples, _pack) = parse_replay(replay);
     if frames != EXPECTED_FRAMES {
@@ -308,10 +368,29 @@ fn validate_with(
     dus.sort_unstable();
     let mean_du = dus.iter().sum::<u64>() / dus.len() as u64;
     let p95 = dus[(dus.len() as f64 * 0.95) as usize];
-    // Measurement only (no gate): the M1 relief tri growth is read off this.
+    let mut prs: Vec<u64> = samples.iter().map(|s| s.pr).collect();
+    prs.sort_unstable();
+    let p95_pr = prs[(prs.len() as f64 * 0.95) as usize];
     let mean_pr = samples.iter().map(|s| s.pr).sum::<u64>() / samples.len() as u64;
+    let mut drs: Vec<u64> = samples.iter().map(|s| s.dr).collect();
+    drs.sort_unstable();
+    let p95_dr = drs[(drs.len() as f64 * 0.95) as usize];
+    // Cost ceilings (chunk-culling rung, 2026-10-03): the asymmetric gates
+    // see CostCeils. M1's relief tri growth is still read off mean_pr/p95_pr.
+    if mean_pr > cost.pr_mean {
+        return Err(format!(
+            "mean primitives {mean_pr} > ceiling {} (chunk culling regressed?)",
+            cost.pr_mean
+        ));
+    }
+    if p95_dr > cost.dr_p95 {
+        return Err(format!(
+            "p95 draw calls {p95_dr} > ceiling {} (chunk binning runaway?)",
+            cost.dr_p95
+        ));
+    }
     Ok(format!(
-        "frames {frames}, mean brightness {mean_bm:.3}, variance {mean_bv:.4}, veg {mean_veg:.3} (min {min_veg:.3}), man-made {mean_mm:.3} (min {min_mm:.3}), sky {mean_sky:.4}, worst pos err {worst_pos:.2e}, frame dt mean {mean_du} us / p95 {p95} us, pr mean {mean_pr}"
+        "frames {frames}, mean brightness {mean_bm:.3}, variance {mean_bv:.4}, veg {mean_veg:.3} (min {min_veg:.3}), man-made {mean_mm:.3} (min {min_mm:.3}), sky {mean_sky:.4}, worst pos err {worst_pos:.2e}, frame dt mean {mean_du} us / p95 {p95} us, pr mean {mean_pr} / p95 {p95_pr}, draw calls p95 {p95_dr}"
     ))
 }
 
@@ -753,6 +832,9 @@ struct AreaSpec {
     /// areas pin from their first full pass; suburb keeps the corridor
     /// constants it is byte-identical to). All are dated measured facts.
     floors: PixelFloors,
+    /// Render-cost ceilings: the pre-chunk/monolith vs chunked canon measures
+    /// per area (CostCeils; the same 2026-10-03 pin pass as the floors).
+    cost: CostCeils,
 }
 
 /// Unpinned-floor sentinel was Infinity until S5; per-area floors below are
@@ -800,6 +882,7 @@ const AREAS: &[AreaSpec] = &[
         vx: -14.0,
         track: "tools/godot_smoke/track/city.json",
         floors: CITY_FLOORS,
+        cost: CITY_COST,
     },
     AreaSpec {
         name: "suburb",
@@ -813,6 +896,7 @@ const AREAS: &[AreaSpec] = &[
         vx: -14.0,
         track: DEMO_TRACK,
         floors: CORRIDOR_FLOORS,
+        cost: CORRIDOR_COST,
     },
     AreaSpec {
         name: "coast",
@@ -826,6 +910,7 @@ const AREAS: &[AreaSpec] = &[
         vx: -14.0,
         track: "tools/godot_smoke/track/coast.json",
         floors: COAST_FLOORS,
+        cost: COAST_COST,
     },
     AreaSpec {
         name: "hills",
@@ -839,6 +924,7 @@ const AREAS: &[AreaSpec] = &[
         vx: -14.0,
         track: "tools/godot_smoke/track/hills.json",
         floors: HILLS_FLOORS,
+        cost: HILLS_COST,
     },
 ];
 
@@ -1040,7 +1126,7 @@ fn demo_areas() {
             "{}: relief echo != pack.json elevation range",
             spec.name
         );
-        let summary = validate_with(&replay, &rows, spec.floors)
+        let summary = validate_with(&replay, &rows, spec.floors, spec.cost)
             .unwrap_or_else(|e| panic!("{}: DARTER_AREA gates: {e}", spec.name));
         assert_eq!(
             parse_area_field(&replay).as_deref(),

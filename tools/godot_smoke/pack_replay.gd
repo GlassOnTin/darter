@@ -6,8 +6,9 @@
 #
 # The pack loader is the renderer-side pack reader: it parses scene.obj
 # (chunk-local vertices re-emitted per o group; face indices file-global
-# 1-based; one material per chunk) into ONE ArrayMesh
-# with a surface per material and asserts the o-group family counts against
+# 1-based; one material per chunk) into one ArrayMesh per WORLD_CHUNK-sized
+# grid cell (faces bin by bbox min corner), with a surface per material and
+# asserts the o-group family counts against
 # pack.json's counts — the same contract tools/area_pack.py's validator
 # checks, now verified by the consumer side. A mismatch aborts the run.
 #
@@ -16,8 +17,11 @@
 # proper rotation, so triangle orientation is preserved. The OBJ winds
 # triangles CCW around the outward normal (verified against backface culling
 # from the air, tools/area_pack.py); Godot's front faces are CLOCKWISE, so
-# the loader reverses each face's index order and attaches per-vertex flat
-# normals computed from the unflipped winding.
+# the loader reverses each face's index order (stored indices run i2, i1,
+# i0) and attaches per-vertex flat normals computed from the unflipped
+# winding. The chunk split reads faces through those stored indices and
+# emits them in slot order — a second reversal there renders every cell
+# face back-facing and culls away the foliage and the ground.
 #
 # Camera: a chase cam 10 m behind the quad along its recorded velocity and
 # 4 m above, looking at it — a level transit shows the neighbourhood ahead
@@ -34,6 +38,14 @@ extends Node3D
 
 const MOVIE_FPS := 30.0
 const SECONDS := 20.0
+
+# World-mesh chunk cell edge (m): faces bin by bbox min corner; one
+# MeshInstance3D per cell gives Godot's per-instance frustum cull its
+# granularity. 64 m chosen from the 2026-10-03 sweep (city: 23.0% visible at
+# 16 m but 2800 draw calls/frame; 28.8% at 64 m, 386 calls, 440 max — the
+# triangle saving dominates on the phone GPU; revisit the constant only on
+# new measurements).
+const WORLD_CHUNK := 64.0
 
 # Fixed surface order (deterministic mesh build); a material present in the
 # OBJ but missing here falls back to grey and is still emitted.
@@ -279,8 +291,8 @@ func _load_pack_and_build_scene() -> void:
 		get_tree().quit(1)
 		return
 	var text := of.get_as_text()
-	var mesh := _obj_to_mesh(text, pack)
-	if mesh == null:
+	var meshes: Array = _obj_to_mesh(text, pack)
+	if meshes.is_empty():
 		get_tree().quit(1)
 		return
 	var load_ms := (Time.get_ticks_usec() - t0) / 1000
@@ -305,9 +317,16 @@ func _load_pack_and_build_scene() -> void:
 		]
 	print("PACK_LOAD_DONE ms=%d groups={%s}" % [load_ms, groups_json])
 
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	add_child(mi)
+	# One node per world chunk so Godot's per-instance frustum cull drops
+	# off-frame triangles: the rung lever (sweep 2026-10-03, city canon path —
+	# 28.8% of triangles live inside chunks that can intersect the chase-cam
+	# frustum at 64 m cells; the other 71% never rasterize).
+	var cells_parent := Node3D.new()
+	add_child(cells_parent)
+	for m in meshes:
+		var mi := MeshInstance3D.new()
+		mi.mesh = m
+		cells_parent.add_child(mi)
 
 	quad = MeshInstance3D.new()
 	var bm := BoxMesh.new()
@@ -343,7 +362,7 @@ func _load_pack_and_build_scene() -> void:
 		])
 
 
-func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
+func _obj_to_mesh(text: String, pack: Dictionary) -> Array:
 	# Chunks are [mat, verts, norms, indices]. Face indices are resolved AT
 	# PARSE TIME against a running committed-vertex base per material, so the
 	# later concat needs no remap pass. Chunk-local arrays are appened to by
@@ -397,13 +416,13 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 			"v":
 				if not mat_set or cur_mat == "":
 					push_error("vertex before usemtl (pack format violation): %s" % line)
-					return null
+					return []
 				if cur_base < 0:
 					cur_base = int(mat_base.get(cur_mat, 0))
 				var p: PackedFloat64Array = line.substr(2).split_floats(" ")
 				if p.size() != 3:
 					push_error("bad vertex line: %s" % line)
-					return null
+					return []
 				# ENU (x east, y north, z up) -> Godot (x, z, -y), Y up.
 				cur_verts.append(Vector3(p[0], p[2], -p[1]))
 				cur_cols.append(cur_seed)
@@ -412,7 +431,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 				var idx: PackedFloat64Array = line.substr(2).split_floats(" ")
 				if idx.size() != 3 or cur_base < 0:
 					push_error("bad face line: %s" % line)
-					return null
+					return []
 				# Face indices are FILE-GLOBAL 1-based; each chunk re-emits
 				# its own verts, so g - chunk_v0 - 1 is the chunk-local slot.
 				var i0 := int(idx[0]) - chunk_v0 - 1
@@ -421,7 +440,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 				if i0 < 0 or i1 < 0 or i2 < 0 or i0 >= cur_verts.size() \
 						or i1 >= cur_verts.size() or i2 >= cur_verts.size():
 					push_error("face references outside its chunk: %s" % line)
-					return null
+					return []
 				var a: Vector3 = cur_verts[i0]
 				var b: Vector3 = cur_verts[i1]
 				var c: Vector3 = cur_verts[i2]
@@ -443,7 +462,7 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 	for fam in group_counts:
 		if not known.has(fam):
 			push_error("unknown o-group family %s" % fam)
-			return null
+			return []
 	var want := {
 		"ground": 1, "grass": int(pack["counts"]["grass"]),
 		"road": int(pack["counts"]["roads"]),
@@ -458,15 +477,15 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 			push_error("pack scene.o groups: family %s %d != %d from pack.json" % [
 				fam, int(group_counts.get(fam, 0)), int(want[fam])
 			])
-			return null
+			return []
 	var strips := int(group_counts.get("hedge", 0)) + int(group_counts.get("fence", 0))
 	if strips != int(pack["counts"]["strips"]):
 		push_error("pack scene.o groups: hedge+fence %d != %d strips" % [
 			strips, int(pack["counts"]["strips"])
 		])
-		return null
+		return []
 
-	# One surface per material, fixed order.
+	# One material-payload per material, as before.
 	var surf := {}
 	for ch in chunks:
 		if not surf.has(ch[0]):
@@ -477,33 +496,87 @@ func _obj_to_mesh(text: String, pack: Dictionary) -> ArrayMesh:
 		s[2].append_array(ch[3])
 		s[3].append_array(ch[4])
 
-	var mesh := ArrayMesh.new()
-	var used := 0
-	for mat in MATERIAL_ORDER:
-		if not surf.has(mat):
-			continue
-		var s = surf[mat]
-		if s[0].size() == 0:
-			continue
-		var arrays := []
-		arrays.resize(Mesh.ARRAY_MAX)
-		arrays[Mesh.ARRAY_VERTEX] = s[0]
-		arrays[Mesh.ARRAY_NORMAL] = s[1]
-		# Per-building seed as float grey (S2 shaders read COLOR.r).
-		var cols := PackedColorArray()
-		cols.resize(s[0].size())
-		for i in s[0].size():
-			cols[i] = Color(s[2][i], s[2][i], s[2][i], 1.0)
-		arrays[Mesh.ARRAY_COLOR] = cols
-		arrays[Mesh.ARRAY_INDEX] = s[3]
-		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-		mesh.surface_set_material(used, _shader_for(mat))
-		used += 1
 	for mat in surf:
 		if not MATERIAL_ORDER.has(mat):
 			push_error("material %s not in MATERIAL_ORDER" % mat)
-			return null
-	return mesh
+			return []
+
+	# Frustum-culling split: one mesh per 64 m grid cell, faces binned by
+	# their bbox min corner (the rule the sweep measured: 28.8% of city
+	# triangles inside frustum-touchable chunks). Same triangle set, opaque
+	# materials: pixels must not move — the canon's pixel floors gate that.
+	# Plain-array accumulators: appending through a plain-array ELEMENT
+	# mutates the stored packed array in place; appending to a DICT-HELD
+	# packed array copies per call (COW) and silently drops the writes.
+	var cells := {}  # Vector3i -> {material -> [v, n, seeds, idx]}
+	for mat in surf:
+		var s2 = surf[mat]
+		var verts: PackedVector3Array = s2[0]
+		var norms: PackedVector3Array = s2[1]
+		var seeds: PackedFloat64Array = s2[2]
+		var idx: PackedInt32Array = s2[3]
+		for fi in range(0, idx.size(), 3):
+			var a := verts[idx[fi]]
+			var b := verts[idx[fi + 1]]
+			var c := verts[idx[fi + 2]]
+			var cell := Vector3i(
+				floori(min(a.x, min(b.x, c.x)) / WORLD_CHUNK),
+				floori(min(a.y, min(b.y, c.y)) / WORLD_CHUNK),
+				floori(min(a.z, min(b.z, c.z)) / WORLD_CHUNK))
+			if not cells.has(cell):
+				cells[cell] = {}
+			var by_mat: Dictionary = cells[cell]
+			if not by_mat.has(mat):
+				by_mat[mat] = [Array(), Array(), Array(), Array()]
+			var acc: Array = by_mat[mat]
+			var base: int = acc[0].size()
+			acc[0].append(a)
+			acc[0].append(b)
+			acc[0].append(c)
+			acc[1].append(norms[idx[fi]])
+			acc[1].append(norms[idx[fi + 1]])
+			acc[1].append(norms[idx[fi + 2]])
+			acc[2].append(seeds[idx[fi]])
+			acc[2].append(seeds[idx[fi + 1]])
+			acc[2].append(seeds[idx[fi + 2]])
+			# The slot triple (a,b,c) already came through the parse's single
+			# winding reversal (stored indices run i2,i1,i0), so emit them in
+			# slot order; reversing again would render every cell face
+			# back-facing — trees and the ground cull away.
+			acc[3].append(base + 0)
+			acc[3].append(base + 1)
+			acc[3].append(base + 2)
+
+	# One ArrayMesh per cell, surfaces in the fixed material order; meshes
+	# come back in deterministic first-face order.
+	var meshes: Array = []
+	for cell in cells:
+		var by_mat: Dictionary = cells[cell]
+		var cm := ArrayMesh.new()
+		var used := 0
+		for mat in MATERIAL_ORDER:
+			if not by_mat.has(mat):
+				continue
+			var acc: Array = by_mat[mat]
+			if acc[0].is_empty():
+				continue
+			var arrays := []
+			arrays.resize(Mesh.ARRAY_MAX)
+			arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array(acc[0])
+			arrays[Mesh.ARRAY_NORMAL] = PackedVector3Array(acc[1])
+			# Per-building seed as float grey (S2 shaders read COLOR.r).
+			var seed_vals := PackedFloat64Array(acc[2])
+			var cols := PackedColorArray()
+			cols.resize(seed_vals.size())
+			for i in seed_vals.size():
+				cols[i] = Color(seed_vals[i], seed_vals[i], seed_vals[i], 1.0)
+			arrays[Mesh.ARRAY_COLOR] = cols
+			arrays[Mesh.ARRAY_INDEX] = PackedInt32Array(acc[3])
+			cm.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+			cm.surface_set_material(used, _shader_for(mat))
+			used += 1
+		meshes.append(cm)
+	return meshes
 
 
 func _shader_for(name: String) -> Material:
