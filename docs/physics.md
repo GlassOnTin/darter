@@ -448,6 +448,15 @@ Arming/flight sequencing (WaitGrace 5 s arm-grace, WaitArmed, 0.25 s settle +
 not the physics; the harness is the only place wall-clock and real-firmware
 nondeterminism enter a run.
 
+The binary path is a caller input, not a fixed location: `sim_run --bin` and
+`DarterFlyer::flyer_start`'s `sitl_bin` name any resolved binary, and the
+record header names what actually flew (path plus its sha256). The desktop
+evidence for that seam (M2c, `tests/godot_flyer.rs`) copies the SITL to a
+fresh path and flies the sensor-model hover through the class at the same
+estimate gates `tests/sitl_loop.rs` measures; the on-device form (the
+extracted executable Android's jniLibs places under nativeLibraryDir) is
+verified with the packaging rung, not here.
+
 ## 12. Calibration status
 
 Policy (`tests/calibration.rs`): the held-out anchor. `ct0` is fit from the

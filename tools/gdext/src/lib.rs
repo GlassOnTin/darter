@@ -23,6 +23,7 @@
 use darter_core::flight::{CoreFlight, CoreSetup, TICK_DT};
 use darter_core::flyer::{Flyer, FlyerConfig};
 use darter_core::preset::Preset;
+use darter_core::sensor::SensorConfig;
 use darter_core::terrain::TerrainGrid;
 use darter_core::DVec3;
 use godot::prelude::*;
@@ -244,12 +245,20 @@ struct DarterFlyer {
     /// The flight in progress; `flyer_finish` consumes and clears it. Every
     /// method guards on None instead of unwrapping across the FFI boundary.
     flyer: Option<Flyer>,
+    /// Simulation input for the next (and, sticky, every) `flyer_start`:
+    /// the sensor model, set by `flyer_set_sensors`. Consumed-config pattern
+    /// DarterQuad's `setup`/`set_throttle` use, minus the per-flight clear —
+    /// a persistent instance keeps its configured inputs across flights.
+    sensors_pending: Option<SensorConfig>,
 }
 
 #[godot_api]
 impl IRefCounted for DarterFlyer {
     fn init(_base: Base<RefCounted>) -> Self {
-        Self { flyer: None }
+        Self {
+            flyer: None,
+            sensors_pending: None,
+        }
     }
 }
 
@@ -298,6 +307,13 @@ impl DarterFlyer {
         cfg.yaw = yaw;
         cfg.yaw_until = if yaw_until > 0.0 { yaw_until } else { f64::INFINITY };
         cfg.profile = if profile.is_empty() { None } else { Some(profile) };
+        if let Some(mut s) = self.sensors_pending {
+            // sim_run's --sensors seed rule, class-side: the sensor model
+            // follows the run seed (the class has no separate seed spec, so
+            // there is nothing to leave pinned).
+            s.seed = seed;
+            cfg.sensor_cfg = Some(s);
+        }
         match Flyer::start(&cfg, std::path::Path::new(&work), "flight.jsonl") {
             Ok(f) => {
                 self.flyer = Some(f);
@@ -308,6 +324,15 @@ impl DarterFlyer {
                 e
             }
         }
+    }
+
+    /// Enable (true) or disable (false) the sensor model for the next
+    /// flights — the equivalent of sim_run's bare `--sensors`:
+    /// `SensorConfig::DEFAULT`, its seed following each flight's run seed
+    /// (see flyer_start). Sticky until changed.
+    #[func]
+    fn flyer_set_sensors(&mut self, enabled: bool) {
+        self.sensors_pending = if enabled { Some(SensorConfig::DEFAULT) } else { None };
     }
 
     /// Advance at most `n` more 250 Hz ticks (no-op past the plan). Returns

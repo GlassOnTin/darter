@@ -122,7 +122,10 @@ not in CI). It drives the same closed loop `sim_run --mode closed` runs —
 SITL child + profile over MSP CLI + arming state machine — from GDScript
 through the DarterFlyer class (M2b); the contract is behaviour, not byte
 parity, because the firmware's PID loop runs on wall-clock time
-(`docs/physics.md` section 11):
+(`docs/physics.md` section 11). Its second flight (M2c) is the level hover
+with the sensor model on, flown with the SITL binary copied to a
+caller-chosen path — the relocation seam the on-device export will use —
+with the record header naming the copy as the binary that flew:
 
 ```
 cargo test --test godot_flyer -- --ignored --test-threads=1

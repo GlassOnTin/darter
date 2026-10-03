@@ -15,7 +15,10 @@ extends Node
 #   DARTER_FLYER_THROTTLE  Fly-phase throttle (default 0.16)
 #   DARTER_FLYER_YAW / _YAW_UNTIL  yaw stick value and the sim time it releases
 #   DARTER_FLYER_PROFILE   ';'-joined profile lines ("" = runner default)
-# Terrain, sensor and wind stay off. Pumps 50 ticks (~0.2 s sim) per call,
+#   DARTER_FLYER_SENSORS   set (nonempty, not "0") = sensor model on via
+#                          flyer_set_sensors before flyer_start (sim_run's
+#                          --sensors; sensor seed follows the run seed)
+# Terrain and wind stay off. Pumps 50 ticks (~0.2 s sim) per call,
 # because flyer_pump wall-paces each tick internally: chunked pumping keeps
 # the same wall-clock pacing, per-call state visible on the caller side.
 
@@ -29,6 +32,9 @@ func _ready() -> void:
 		_fail("DARTER_FLYER_BIN unset")
 
 	var flyer: DarterFlyer = DarterFlyer.new()
+	var sensors := OS.get_environment("DARTER_FLYER_SENSORS")
+	if sensors != "" and sensors != "0":
+		flyer.flyer_set_sensors(true)
 	var err: String = flyer.flyer_start(bin, work,
 			_env_f("DURATION", 13.0), _env_i("SEED", 5), _env_f("THROTTLE", 0.16),
 			_env_f("YAW", 0.0), _env_f("YAW_UNTIL", 0.0),

@@ -27,9 +27,9 @@
 //!
 //! Not verified here: the live per-rendered-frame API (pacing under a real
 //! display driver; this suite is headless and wall-paced only), terrain/
-//! sensor/wind configs through the class (sim_run covers those), the
-//! Android arm64 .so, and the M2c spawned-SITL seam (the sitl-binary
-//! parameter becomes an on-device path there).
+//! wind configs through the class (sim_run covers those), the Android
+//! arm64 .so, and the on-device form of the M2c seam (nativeLibraryDir
+//! extraction of the shipped SITL binary).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -58,21 +58,40 @@ fn temp_dir(name: &str) -> PathBuf {
     d
 }
 
+fn sha256_file(path: &Path) -> String {
+    let bytes = std::fs::read(path).expect("read binary for sha256");
+    let mut h = darter_core::sha256::Sha256::new();
+    h.update(&bytes);
+    darter_core::sha256::to_hex(&h.finish())
+}
+
 fn locate_godot() -> PathBuf {
     let path = match std::env::var("DARTER_GODOT") {
         Ok(p) => PathBuf::from(p),
         Err(_) => PathBuf::from("tools/godot/bin/godot"),
     };
     assert!(path.exists(), "Godot binary missing at {path:?}: run the download pinned in tests/godot.rs (Godot 4.7.2-stable linux.x86_64), or set DARTER_GODOT");
-    let bytes = std::fs::read(&path).expect("read godot binary");
-    let mut h = darter_core::sha256::Sha256::new();
-    h.update(&bytes);
-    let got = darter_core::sha256::to_hex(&h.finish());
     assert_eq!(
-        got, GODOT_SHA256,
+        sha256_file(&path),
+        GODOT_SHA256,
         "Godot binary at {path:?} does not match the pinned provenance"
     );
     path
+}
+
+/// The SITL binary to spawn (DARTER_FLYER_SITL_BIN overrides); same path
+/// sim_run --bin defaults to. The relocation test copies it elsewhere — the
+/// M2c seam — and points the run at the copy.
+fn locate_sitl() -> PathBuf {
+    let src = match std::env::var("DARTER_FLYER_SITL_BIN") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => PathBuf::from(darter_core::flyer::DEFAULT_SITL_BIN),
+    };
+    assert!(
+        src.exists(),
+        "Betaflight SITL binary missing at {src:?}: build it (tests/sitl_loop.rs recipe) or set DARTER_FLYER_SITL_BIN"
+    );
+    src
 }
 
 fn locate_extension() -> PathBuf {
@@ -115,7 +134,9 @@ fn port_free_or_skip() -> bool {
 /// Run one closed flight through the DarterFlyer class and return the work
 /// dir holding its record. The probe pumps 50 ticks per call, so the whole
 /// run flows through flyer_pump() chunking — the class's per-call contract.
-fn run_probe(name: &str) -> PathBuf {
+/// `extra` carries per-scene env pairs on top of the common DURATION,
+/// THROTTLE and PROFILE settings.
+fn run_probe(name: &str, extra: &[(&str, String)]) -> PathBuf {
     let godot = locate_godot();
     prepare_extension(&godot);
     let dir = temp_dir(name);
@@ -128,13 +149,10 @@ fn run_probe(name: &str) -> PathBuf {
         .env("DARTER_FLYER_WORK", &dir)
         .env("DARTER_FLYER_BIN", &env_bin)
         .env("DARTER_FLYER_DURATION", format!("{DURATION_S}"))
-        .env("DARTER_FLYER_SEED", "5")
-        .env("DARTER_FLYER_THROTTLE", "0.16")
-        .env("DARTER_FLYER_YAW", "0.5")
-        .env("DARTER_FLYER_YAW_UNTIL", "6.0")
         .env("DARTER_FLYER_PROFILE", "")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .envs(extra.iter().cloned())
         .spawn()
         .expect("spawn godot");
     // Poll to a deadline instead of blocking on wait_with_output: the probe
@@ -183,6 +201,9 @@ struct Row {
     qx: f64,
     qy: f64,
     qz: f64,
+    /// The FC's Mahony estimates (att_r/att_p arrive in centidegrees).
+    att_r_deg: f64,
+    att_p_deg: f64,
     att_y_deg: f64,
     armed: bool,
     /// The FC's arming_disable bitfield (runtime_config.h), NOT an armed
@@ -220,6 +241,8 @@ fn load_record(out_dir: &Path) -> (String, Vec<Row>) {
             qx: fnum(l, "qx"),
             qy: fnum(l, "qy"),
             qz: fnum(l, "qz"),
+            att_r_deg: fnum(l, "att_r") / 10.0,
+            att_p_deg: fnum(l, "att_p") / 10.0,
             att_y_deg: fnum(l, "att_y"),
             armed: fnum(l, "flags") as u32 & 1 == 1,
             arm_disable: fnum(l, "arm") as u32,
@@ -249,7 +272,15 @@ fn godot_flyer_closed_yaw_driven_through_class() {
         eprintln!("port 5761 busy — skipping");
         return;
     }
-    let dir = run_probe("yaw");
+    let dir = run_probe(
+        "yaw",
+        &[
+            ("DARTER_FLYER_SEED", "5".into()),
+            ("DARTER_FLYER_THROTTLE", "0.16".into()),
+            ("DARTER_FLYER_YAW", "0.5".into()),
+            ("DARTER_FLYER_YAW_UNTIL", "6.0".into()),
+        ],
+    );
     let (header, rows) = load_record(&dir);
 
     // Record-header contract: closed mode, the applied profile, the SITL
@@ -350,5 +381,129 @@ fn godot_flyer_closed_yaw_driven_through_class() {
         "flyer yaw (class-driven): burst {burst_turn:.0} deg CW in 1.5 s, {mode}, \
          att_y-(-yaw_enu) mean {mean_off:+.1} |max| {max_off:.1} deg (n={})",
         armed.len()
+    );
+}
+
+/// M2c rung: the relocated-binary seam, driven through the class. The SITL
+/// binary is copied to a fresh path outside the flight's work dir — the
+/// situation an app faces with an extracted executable (the Android export
+/// will land it in the app's nativeLibraryDir, nowhere near the flight's
+/// cwd) — and the flight runs with the copy: the caller resolves the path,
+/// the class honours it end to end. The flight is sim_run's level hover
+/// with the sensor model on (`flyer_set_sensors(true)` before start, the
+/// sensor seed following the run seed exactly like sim_run's bare
+/// `--sensors`), carrying sitl_loop.rs's measured contract: the FC's Mahony
+/// roll/pitch estimates track the sim's truth within 2 deg mean / 3.5 deg
+/// max in the settled window. The record header must name the copy as the
+/// binary that actually flew (sitl path and its own sha256).
+#[test]
+#[ignore = "needs tools/godot/bin/godot (pinned 4.7.2-stable), a built tools/gdext extension, and the Betaflight SITL binary; run: cargo test --test godot_flyer -- --ignored --test-threads=1"]
+fn godot_flyer_closed_hover_with_relocated_sitl() {
+    if !port_free_or_skip() {
+        eprintln!("port 5761 busy — skipping");
+        return;
+    }
+    let src = locate_sitl();
+    let bin_dir = temp_dir("relocated");
+    let copy = bin_dir.join("libbetaflight_sitl");
+    std::fs::copy(&src, &copy).expect("relocate SITL binary");
+    let copy_sha = sha256_file(&copy);
+    assert_eq!(
+        copy_sha,
+        sha256_file(&src),
+        "relocated copy differs — the seam test must copy a real binary"
+    );
+
+    let dir = run_probe(
+        "hover",
+        &[
+            // Overrides run_probe's resolved default: the caller's path is
+            // what the flight spawns — the seam itself.
+            ("DARTER_FLYER_BIN", copy.to_string_lossy().into_owned()),
+            ("DARTER_FLYER_SEED", "9".into()),
+            ("DARTER_FLYER_THROTTLE", "0.16".into()),
+            ("DARTER_FLYER_SENSORS", "1".into()),
+        ],
+    );
+    let (header, rows) = load_record(&dir);
+
+    // Second rung of the header contract: the relocated copy is recorded as
+    // the binary that flew — its path and its sha256 — alongside closed
+    // mode, the applied profile, the enabled sensor model and the SITL's
+    // version string.
+    assert!(
+        header.contains("\"mode\":\"closed\""),
+        "header mode not closed: {header}"
+    );
+    assert!(
+        header.contains("\"profile\":[\""),
+        "profile not applied (header): {header}"
+    );
+    assert!(
+        header.contains("\"sensors\":{"),
+        "sensor model not enabled (header): {header}"
+    );
+    assert!(
+        header.contains(&format!("\"path\":\"{}\"", copy.to_string_lossy())),
+        "header sitl path is not the relocated copy: {header}"
+    );
+    assert!(
+        header.contains(&format!("\"sha256\":\"{copy_sha}\"")),
+        "header sitl sha256 is not the relocated copy's: {header}"
+    );
+    assert!(
+        header.contains("Betaflight /"),
+        "sitl version missing (header): {header}"
+    );
+
+    // The hover estimate contract, identical to sitl_loop.rs's measured gate
+    // for sim_run --sensors (seed 9): settled window arm+2 .. arm+7, the
+    // Mahony roll/pitch estimates against the sim's quaternion truth.
+    let armed = armed_rows(&rows);
+    assert!(!armed.is_empty(), "never armed — record in {dir:?}");
+    let a0 = armed[0].t;
+    let window: Vec<&Row> = armed
+        .iter()
+        .copied()
+        .filter(|r| a0 + 2.0 <= r.t && r.t <= a0 + 7.0)
+        .collect();
+    assert!(
+        window.len() > 50,
+        "hover window too thin: {} rows",
+        window.len()
+    );
+    let truth = |r: &Row| -> (f64, f64) {
+        let roll = (2.0 * (r.qw * r.qx + r.qy * r.qz))
+            .atan2(1.0 - 2.0 * (r.qx * r.qx + r.qy * r.qy))
+            .to_degrees();
+        let sinp = (2.0 * (r.qw * r.qy - r.qz * r.qx)).clamp(-1.0, 1.0);
+        (roll, sinp.asin().to_degrees())
+    };
+    let mut errs_r = Vec::with_capacity(window.len());
+    let mut errs_p = Vec::with_capacity(window.len());
+    for r in &window {
+        let (roll, pitch) = truth(r);
+        errs_r.push(wrap180(r.att_r_deg - roll));
+        errs_p.push(wrap180(r.att_p_deg - pitch));
+    }
+    let stat = |v: &[f64]| -> (f64, f64) {
+        let mean = v.iter().map(|e| e.abs()).sum::<f64>() / v.len() as f64;
+        let max = v.iter().fold(0.0f64, |m, e| m.max(e.abs()));
+        (mean, max)
+    };
+    let (rm, rx) = stat(&errs_r);
+    let (pm, px) = stat(&errs_p);
+    println!(
+        "flyer hover (class-driven, relocated SITL): roll |err| mean {rm:.2} |max| {rx:.2} deg; \
+         pitch |err| mean {pm:.2} |max| {px:.2} deg (n={})",
+        window.len()
+    );
+    assert!(
+        rm <= 2.0 && pm <= 2.0,
+        "estimate mean beyond 2 deg: roll {rm:.2}, pitch {pm:.2}"
+    );
+    assert!(
+        rx <= 3.5 && px <= 3.5,
+        "estimate max beyond 3.5 deg: roll {rx:.2}, pitch {px:.2}"
     );
 }
