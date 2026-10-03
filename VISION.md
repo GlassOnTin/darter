@@ -18,6 +18,14 @@ flight-controller behaviour stands in where a SITL build is impractical.
 Tuning, configuration and fault-recovery checks then happen in the simulator,
 against real terrain, before anything flies for real.
 
+The game is as much a means to a larger end: making applied mathematics
+playable. The parameter tables it flies on are the output of an offline (or
+in-browser, via the fenics-rs wasm build) solver chain fed by parametric
+descriptions of standard drone geometries, so a new preset class can be
+derived a priori from published source models rather than invented, and every
+derivation step stays inspectable like the rest of the code. The solvers never
+run inside the 8 kHz flight loop; their products enter it as data.
+
 Each ingredient exists somewhere on its own. Closed sims (Liftoff, Velocidrone,
 Uncrashed) have polish but approximate the flight stack, ship baked scenery, and
 several carry ads or subscriptions. Research projects (Flightmare,
@@ -50,6 +58,9 @@ read every line of code that produced what they saw.
    Unreal via `sim/ue_bridge.py`. This simulator offers a second world with
    deterministic, seeded, headless runs and an OSM-backed reality that the UE
    world cannot match.
+5. Curious players who want to see the applied maths underneath a drone made
+   concrete and playable: the solver chain, the model documents, and the
+   derivation lineage are part of the product, not tooling hidden behind it.
 
 ## Pillars
 
@@ -71,7 +82,9 @@ read every line of code that produced what they saw.
   the real firmware.
 - Aircraft presets are data files (5" freestyle 4S/6S, whoop, 7" long range, 10"
   mapping platform): mass, Kv, prop thrust data, battery model. Where a number
-  is measured the preset says so; where it is estimated the UI says so.
+  is measured the preset says so; where it is estimated the UI says so; where
+  it is computed a priori from published models the preset says that too, and
+  names the model.
 
 ### 2. Physics that earns trust
 
@@ -91,6 +104,11 @@ read every line of code that produced what they saw.
   what makes RPM filtering tunable in-sim.
 - Determinism: recorded inputs plus seeded wind reproduce a flight bit-for-bit.
   This serves CI regressions, bug reports, and training runs.
+- Table-fed corrections: effects too expensive to resolve inside the loop
+  (vortex-ring descent, prop wash on the airframe, ground effect, wind
+  shadowing) enter as preset tables computed offline before play. Provenance
+  labels distinguish measured, fitted, estimated, and a priori (docs/physics.md,
+  M6).
 - Honesty over claims: the model and its known errors are published, starting
   with residuals against recorded flight logs (step response, thrust curves).
   "Realistic" is a measured property here or it is not claimed.
@@ -176,6 +194,16 @@ work until this world can take over.
   physics residuals.
 - M5, together. Ghost racing, multiplayer rooms over plain UDP, community track
   sharing.
+- M6, a priori presets. A parametric library of standard multirotor geometries
+  (frame class, motor, prop, battery) feeding an offline or browser-based
+  solver chain that derives the tables presets need before play: frame
+  resonance spectra for the vibration model, descent-through-wash and
+  ground-effect thrust corrections for the prop model, antenna and link
+  estimates later. Candidate means include LES turbulence or SPH wake solvers
+  coupled to fenics-rs structural models, and plain literature curves first;
+  the milestone is defined by its preset tables, not by which solver produces
+  them. Nothing solver-shaped runs in the flight loop, and solver output lands
+  in presets under its own provenance label until measured data replaces it.
 
 ## Non-goals (v1)
 
@@ -199,6 +227,9 @@ work until this world can take over.
 - The anisoptera homing stack trains in the headless sim and the results are
   comparable with the UE pipeline.
 - F-Droid packaging is accepted, built from source including SITL binaries.
+- A preset for a geometry class with no bench data on hand is generated a
+  priori from its parametric description, flies in the sim, and shows the
+  provenance class of every table entry.
 
 ## Open questions
 
@@ -212,3 +243,8 @@ work until this world can take over.
 - Multiplayer infrastructure: plain UDP rooms are likely enough; anything
   hosted needs a licence-compatible story.
 - Whether wind shadowing around OSM buildings is worth its complexity, and when.
+- For M6's wake tables: at what point literature curves and a small disc
+  solver stop being enough, and whether a time-dependent LES turbulence model
+  in fenics-rs, or an SPH wake model coupled to a fenics-rs elastic
+  oscillation model, is a side project worth starting rather than a
+  framework-scale rewrite in different clothes.

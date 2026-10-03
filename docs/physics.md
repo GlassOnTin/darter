@@ -610,6 +610,14 @@ a bin-local dependency (the established pattern, like serde_json in the
 track rung). The wasm build is interesting for a future standalone
 education/geometry tool, not for the flight loop.
 
+VISION.md now carries a dedicated milestone for exactly this pipeline (M6,
+"a priori presets"): a parametric library of standard drone geometries, and
+offline or browser-based solver runs that land as preset tables. Outcome-first
+definition: the milestone is the tables, not the solver route; literature
+curves and a small disc solve stay ahead of anything LES- or SPH-shaped, and
+when the tables land they bring a fourth provenance class, `a_priori`, joining
+Measured, Estimated, and Derived, upgradeable in place by measured data.
+
 ## 15. Where the numbers live
 
 - Preset values and labels: `src/preset.rs` (the 18-field provenance table,

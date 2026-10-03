@@ -38,7 +38,7 @@ stands today.
 
 Flying with a radio or on-screen controls, real-firmware SITL (Betaflight,
 INAV, ArduPilot), weather, and multiplayer. The current app replays recorded
-demo flights. These are milestones M2 to M5 of `VISION.md`.
+demo flights. These are milestones M2 onward of `VISION.md`.
 
 ## Try it
 
