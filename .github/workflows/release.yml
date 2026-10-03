@@ -50,6 +50,22 @@ jobs:
           mv tools/godot/bin/Godot_v4.7.2-stable_linux.x86_64 tools/godot/bin/godot
           chmod +x tools/godot/bin/godot
           tools/godot/bin/godot --version
+      # --install-android-build-template extracts android_source.zip from the
+      # export templates directory; a fresh runner has none (the S7 probes
+      # ran on a machine that had the tpz installed since 2026-09-28, which
+      # the first release run 37123481333 proved by failing otherwise).
+      - name: Install export templates (sha512-verified against the committed sums)
+        run: |
+          TPZ=Godot_v4.7.2-stable_export_templates.tpz
+          curl -fsSL -o "$RUNNER_TEMP/templates.tpz" \
+            https://github.com/godotengine/godot/releases/download/4.7.2-stable/"$TPZ"
+          test "$(grep -cF '  '"$TPZ" tools/godot/SHA512-SUMS.txt)" = 1
+          grep -F '  '"$TPZ" tools/godot/SHA512-SUMS.txt \
+            | sed "s#  $TPZ#  $RUNNER_TEMP/templates.tpz#" > "$RUNNER_TEMP/templates.sums"
+          sha512sum -c "$RUNNER_TEMP/templates.sums"
+          mkdir -p "$HOME/.local/share/godot/export_templates"
+          unzip -o "$RUNNER_TEMP/templates.tpz" -d "$RUNNER_TEMP/tpz"
+          mv "$RUNNER_TEMP/tpz/templates" "$HOME/.local/share/godot/export_templates/4.7.2.stable"
       - name: Android SDK pieces (android-36 + build-tools 36.1.0)
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
@@ -72,7 +88,6 @@ jobs:
           # is a separate headless import pass first.
           tools/godot/bin/godot --headless --path "$RUNNER_TEMP/export" --import
           tools/godot/bin/godot --headless --path "$RUNNER_TEMP/export" \
-            --install-android-build-template --export-debug Android 2>&1 | tail -5
             --install-android-build-template --export-debug Android 2>&1 | tail -5
           test -f "$RUNNER_TEMP/export/build/darter-smoke.apk"
           ls -l "$RUNNER_TEMP/export/build/darter-smoke.apk" >> "$GITHUB_STEP_SUMMARY"
