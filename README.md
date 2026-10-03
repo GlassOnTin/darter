@@ -2,7 +2,9 @@
 
 Darter is a quadcopter flight simulator that renders real places. A Rust core
 (`darter-core`) runs the flight physics, f64 with 8 kHz substeps, motor and
-battery models included; Godot 4 renders the scene. The world is built from
+battery models included; Godot 4 renders the scene. The model and its known
+errors are published in [docs/physics.md](docs/physics.md): what is
+implemented, where every number comes from, and what is not attempted. The world is built from
 OpenStreetMap building, road and tree data plus Copernicus GLO-30 elevation
 tiles, so the ground under the quad comes from real map data at real
 coordinates.
@@ -99,6 +101,7 @@ picker and the no-environment error path. Both run in CI on every push.
 | path | contents |
 | --- | --- |
 | `src/` | the `darter-core` crate; `src/bin/sim_run` is the flight recorder CLI |
+| `docs/physics.md` | the applied-maths write-up: model equations, calibration status, known errors |
 | `tools/area_pack.py` | OSM/DEM area importer and pack validator |
 | `tools/godot_smoke/` | Godot 4 test project, demo bundle script, Android export preset |
 | `tests/` | the cargo suites, including the Godot render gates |
