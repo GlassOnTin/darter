@@ -8,3 +8,4 @@ description = "Flight physics core for the Darter drone simulator"
 [dependencies]
 glam = "0.29"
 libc = "0.2"
+serde_json = "1"

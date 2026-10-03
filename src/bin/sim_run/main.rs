@@ -52,6 +52,11 @@ use darter_core::terrain::{Ground, TerrainGrid};
 use darter_core::wind::{WindConfig, WindModel};
 use darter_core::DVec3;
 
+// Wired into the CLI in the next commit (--track); dead_code silences the
+// unused-module warnings in the interim.
+#[allow(dead_code)]
+mod track;
+
 const SUBSTEP_DT: f64 = 125e-6; // 8 kHz core step
 const SUBSTEPS_PER_TICK: usize = 32; // 4 ms tick = 250 Hz fdm/RC
 const TICK_DT: f64 = SUBSTEP_DT * SUBSTEPS_PER_TICK as f64;
