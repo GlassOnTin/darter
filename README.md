@@ -7,7 +7,9 @@ errors are published in [docs/physics.md](docs/physics.md): what is
 implemented, where every number comes from, and what is not attempted. The world is built from
 OpenStreetMap building, road and tree data plus Copernicus GLO-30 elevation
 tiles, so the ground under the quad comes from real map data at real
-coordinates.
+coordinates. Where DEM data is unusable, the importer can instead build a
+playground over seeded procedural relief (`tools/area_pack.py --elevation
+procedural`), alone or layered under real OSM features.
 
 The motivation is to make this a virtual hardware test platform. The real
 flight controller is flown against the simulator, either as emulated firmware

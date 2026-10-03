@@ -33,6 +33,15 @@ system tifffile cannot decode alone. DEM files come from --dem-file
 (offline/CI) or the tile cache under --dem-cache (default tools/
 elevation_cache, populated by the live fetch when missing).
 
+"Procedural" relief needs no DEM and no OSM: a seeded pure-stdlib value-
+noise fBm (three octaves over 480/240/120 m wavelengths, 40 m amplitude)
+stands in for unusable terrain data. With no --osm/--fetch the pack
+carries no OSM-derived features and no ODbL credit — --span sizes the
+playground, the elevation block records the generator seed, and the
+attribution reads "procedural terrain (seed N)". Pack shape: same as
+glo30 (terrain.bin sidecar, snapped span, origin-datum grid), and
+source carries no osm_json_sha256.
+
 Frame: metres, x = east, y = north, z = up, origin at (--lat, --lon) — the
 same convention as the anisoptera sources.
 
@@ -40,6 +49,8 @@ Usage:
   area_pack.py --osm CACHE.json --lat 50.8989 --lon -1.0586 [--seed 5] --out DIR
                      [--elevation flat|glo30 [--dem-file PATH] [--dem-cache DIR]]
   area_pack.py --fetch RADIUS_M --lat L --lon L [--osm CACHE.json] --out DIR
+  area_pack.py --elevation procedural --seed 7 --span 1024 [--lat L --lon N]
+                     --out DIR      (no Overpass input: seeded fBm playground)
   area_pack.py DIR                      (validate a written pack dir)
 """
 import argparse
@@ -67,6 +78,10 @@ SCHEMA = "darter_area_pack"
 # a "water" polygon list appear only when the input has coastline ways or
 # closed water rings (see lines ~117 above, solve_water, and the water tests
 # in tests/area_pack.rs); water-free inputs keep the pre-water bytes exactly.
+# v3 may carry a third elevation model, "procedural" (additive): a seeded
+# value-noise fBm grid in the terrain.bin/origin-datum shape, no tile
+# provenance, and — when no --osm/--fetch ran — source without
+# osm_json_sha256 and attribution without ODbL (tests/area_pack.rs).
 VERSION = 3
 M_PER_DEG_LAT = 111_320.0
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
@@ -143,6 +158,11 @@ GLO30_URL_TEMPLATE = (
     "Copernicus_DSM_COG_10_{lat}_00_{lon}_00_DEM/"
     "Copernicus_DSM_COG_10_{lat}_00_{lon}_00_DEM.tif")
 GLO30_LICENCE = "© Copernicus DEM / ESA (GLO-30)"
+# Procedural relief constants: pure-stdlib value-noise fBm standing in for
+# unusable terrain data. Weights sum to 1, so peaks reach ±PROC_AMPLITUDE_M.
+PROC_WAVELENGTHS_M = (480.0, 240.0, 120.0)
+PROC_WEIGHTS = (0.55, 0.27, 0.18)
+PROC_AMPLITUDE_M = 40.0
 TERRAIN_MAGIC = 0x31524E54          # b"TNR1" little-endian
 TERRAIN_FMT_VERSION = 1             # terrain.bin internal format version
 TERRAIN_HEADER_LEN = 56             # u32 magic + fmt + cols + rows, 5 x f64
@@ -511,6 +531,77 @@ def build_terrain_grid(lat, lon, span, dem_file=None, cache_dir=None):
     return grid
 
 
+def build_terrain_grid_procedural(span, seed):
+    """Node grid for the procedural elevation model (no DEM, no network).
+
+    Seeded integer-lattice value noise blended into fBm across the three
+    octaves in PROC_WAVELENGTHS_M; heights are stored relative to node
+    (0,0) — the same z=0 datum glo30 uses — rounded to 0.1 m, consumed by
+    the identical write_terrain_bin / terrain_h_at path. Consumes no RNG:
+    the lattice function is a pure hash of (seed, octave, ix, iy), and the
+    whole generator is stdlib-only (the glo30 grid needs numpy + tifffile;
+    this one and its writer stay dependency-free). Returns the same dict
+    shape as build_terrain_grid, with "tiles" empty (no DEM to attest).
+    """
+    cells = int(math.ceil(span / TERRAIN_STEP_M))
+    if cells < 1:
+        raise ValueError("terrain span %.1f m below one %d m step"
+                         % (span, TERRAIN_STEP_M))
+    step = TERRAIN_STEP_M
+    span = cells * step
+    cols = cells + 1
+    rows = cols                     # square span
+    origin_x = -span / 2.0
+    origin_y = -span / 2.0
+
+    def noise(u, v, octave):
+        # value noise on an integer lattice: hash the four corners, blend
+        # bilinearly through a smoothstep
+        iu = math.floor(u)
+        iv = math.floor(v)
+        fu = u - iu
+        fv = v - iv
+
+        def corner(ix, iy):
+            x = (ix * 374761393 + iy * 668265263
+                 + octave * 2246822519 + seed * 3266489917) & 0xFFFFFFFF
+            x ^= x >> 13
+            x = (x * 1274126177) & 0xFFFFFFFF
+            return ((x ^ (x >> 16)) & 0xFFFFFFFF) / 4294967296.0
+
+        su = fu * fu * (3.0 - 2.0 * fu)
+        sv = fv * fv * (3.0 - 2.0 * fv)
+        a = corner(iu, iv) + (corner(iu + 1, iv) - corner(iu, iv)) * su
+        b = corner(iu, iv + 1) + (corner(iu + 1, iv + 1) - corner(iu, iv + 1)) * su
+        return a + (b - a) * sv
+
+    z_grid = []
+    raw0 = None
+    for j in range(rows):
+        v = origin_y + j * step
+        row = []
+        for i in range(cols):
+            u = origin_x + i * step
+            n = 0.0
+            for o in range(len(PROC_WAVELENGTHS_M)):
+                n += (PROC_WEIGHTS[o]
+                      * noise(u / PROC_WAVELENGTHS_M[o], v / PROC_WAVELENGTHS_M[o], o))
+            raw = PROC_AMPLITUDE_M * n
+            if raw0 is None:
+                raw0 = raw
+            row.append(round(raw - raw0, 1) + 0.0)   # + 0.0 normalises -0.0
+        z_grid.append(row)
+    grid = {
+        "cols": cols, "rows": rows, "step": step,
+        "origin_x": origin_x, "origin_y": origin_y,
+        "z": z_grid, "z_min": min(min(r) for r in z_grid),
+        "z_max": max(max(r) for r in z_grid),
+        "tiles": [],
+    }
+    grid["h"] = lambda x, y: terrain_h_at(grid, x, y)
+    return grid
+
+
 def terrain_h_at(grid, x, y):
     """Terrain height by linear interpolation over the node grid.
 
@@ -547,7 +638,14 @@ def write_terrain_bin(path, grid):
                          grid["z_min"], grid["z_max"])
     with open(path, "wb") as f:
         f.write(header)
-        grid["z"].tofile(f)
+        z = grid["z"]
+        if hasattr(z, "tofile"):
+            z.tofile(f)
+        else:
+            # list of rows (procedural grid, stdlib-only path)
+            for row in z:
+                for zv in row:
+                    f.write(struct.pack("<d", zv))
 
 
 def parse_height_src(tags):
@@ -1142,11 +1240,17 @@ def build_pack(classified, roads, strips, grass, trees, tree_params, n_tagged,
     pts += [p for s in strips_out for p in s["polyline"]]
     pts += [p for g in grass_out for p in g["ring"]]
     pts += [(t["x"], t["y"]) for t in trees_out]
-    min_x = min(p[0] for p in pts)
-    max_x = max(p[0] for p in pts)
-    min_y = min(p[1] for p in pts)
-    max_y = max(p[1] for p in pts)
-    span = 2 * max(abs(min_x), abs(max_x), abs(min_y), abs(max_y)) + GROUND_PAD
+    if pts:
+        min_x = min(p[0] for p in pts)
+        max_x = max(p[0] for p in pts)
+        min_y = min(p[1] for p in pts)
+        max_y = max(p[1] for p in pts)
+        span = 2 * max(abs(min_x), abs(max_x), abs(min_y), abs(max_y)) + GROUND_PAD
+    else:
+        # featureless scene (procedural packs are the one legal shape): the
+        # span/bounds stamps come later in main, from --span
+        min_x = max_x = min_y = max_y = 0.0
+        span = GROUND_PAD
     origin_inside = any(point_in_poly(0.0, 0.0, b["ring"]) for b in buildings)
 
     return {
@@ -1156,12 +1260,16 @@ def build_pack(classified, roads, strips, grass, trees, tree_params, n_tagged,
         "frame": "metres, x=east y=north z=up, origin at (source.origin_lat, source.origin_lon)",
         "elevation": {"model": "flat", "z_m": 0.0},
         "seed": seed,
-        "source": {
-            "osm_json_sha256": src_sha,
-            "origin_lat": round(lat, 7),
-            "origin_lon": round(lon, 7),
-            "fetched": fetched,
-        },
+        "source": ({"osm_json_sha256": src_sha,
+                    "origin_lat": round(lat, 7),
+                    "origin_lon": round(lon, 7),
+                    "fetched": fetched}
+                   if src_sha else
+                   # no OSM input (procedural build): provenance is the seed,
+                   # validated by the elevation block's own seed match
+                   {"origin_lat": round(lat, 7),
+                    "origin_lon": round(lon, 7),
+                    "fetched": fetched}),
         "bounds": {"min_x": round(min_x, 3), "max_x": round(max_x, 3),
                    "min_y": round(min_y, 3), "max_y": round(max_y, 3)},
         "ground": {"span_m": round(span, 3)},
@@ -1534,9 +1642,16 @@ def validate_pack(pack_dir):
         err(f"schema {pack.get('schema')!r} != {SCHEMA!r}")
     if pack.get("version") != VERSION:
         err(f"version {pack.get('version')!r} != {VERSION}")
+    src = pack.get("source", {})
+    has_osm_data = "osm_json_sha256" in src
     attr = pack.get("attribution", "")
-    if "OpenStreetMap" not in attr:
-        err(f"attribution missing OpenStreetMap credit: {attr!r}")
+    if has_osm_data:
+        if "OpenStreetMap" not in attr:
+            err(f"attribution missing OpenStreetMap credit: {attr!r}")
+    else:
+        # no OSM input (procedural build): the attribution is the seed note
+        if "procedural" not in attr:
+            err(f"attribution missing the procedural credit: {attr!r}")
     if not pack.get("frame"):
         err("frame missing")
     elev = pack.get("elevation", {})
@@ -1545,12 +1660,15 @@ def validate_pack(pack_dir):
             err(f"elevation not a flat z=0 model: {elev!r}")
     elif elev.get("model") == "glo30":
         _validate_glo30_section(pack_dir, pack, elev, err)
+    elif elev.get("model") == "procedural":
+        _validate_procedural_section(pack_dir, pack, elev, err)
     else:
-        err(f"elevation model {elev.get('model')!r} unknown (flat | glo30)")
-    src = pack.get("source", {})
-    sha = src.get("osm_json_sha256", "")
-    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
-        err(f"osm_json_sha256 not sha256 hex: {sha!r}")
+        err(f"elevation model {elev.get('model')!r} unknown "
+            "(flat | glo30 | procedural)")
+    if has_osm_data:
+        sha = src["osm_json_sha256"]
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            err(f"osm_json_sha256 not sha256 hex: {sha!r}")
     if not isinstance(src.get("origin_lat"), (int, float)):
         err("origin_lat missing")
     if not isinstance(src.get("origin_lon"), (int, float)):
@@ -1589,7 +1707,17 @@ def validate_pack(pack_dir):
     pts += [p for g in grass for p in g["ring"]]
     pts += [(t["x"], t["y"]) for t in trees]
     if not pts:
-        err("scene has no points")
+        if elev.get("model") != "procedural":
+            err("scene has no points")
+        else:
+            # the one legal featureless scene: a procedural playground whose
+            # span/bounds stamps come from --span, not a scene hull
+            half = pack.get("ground", {}).get("span_m", 0.0) / 2.0
+            bnd = pack.get("bounds", {})
+            for k, v in (("min_x", -half), ("max_x", half),
+                         ("min_y", -half), ("max_y", half)):
+                if round(bnd.get(k, 0.0), 3) != round(v, 3):
+                    err(f"bounds.{k} {bnd.get(k)} != +/-span/2 {round(v, 3)}")
     else:
         bnd = pack.get("bounds", {})
         want = {"min_x": min(p[0] for p in pts), "max_x": max(p[0] for p in pts),
@@ -1599,8 +1727,8 @@ def validate_pack(pack_dir):
                 err(f"bounds.{k} {bnd.get(k)} != recomputed {round(v, 3)}")
         span = 2 * max(abs(want["min_x"]), abs(want["max_x"]),
                        abs(want["min_y"]), abs(want["max_y"])) + GROUND_PAD
-        if elev.get("model") == "glo30":
-            # the glo30 ground span snaps UP to whole node steps so the node
+        if elev.get("model") in ("glo30", "procedural"):
+            # the ground span snaps UP to whole node steps so the node
             # spacing stays exactly --step and the grid covers the scene
             span = math.ceil(span / TERRAIN_STEP_M) * TERRAIN_STEP_M
         if round(pack.get("ground", {}).get("span_m", 0.0), 3) != round(span, 3):
@@ -1738,7 +1866,7 @@ def validate_pack(pack_dir):
         for name, want in want_groups.items():
             if groups.get(name, 0) != want:
                 err(f"scene.obj {name} groups {groups.get(name, 0)} != {want}")
-        if elev.get("model") == "glo30":
+        if elev.get("model") in ("glo30", "procedural"):
             # the grid ground: two triangles (6 verts) per node cell
             want_v = 6 * (elev["cols"] - 1) * (elev["rows"] - 1)
             got_v = vcount.get("ground", 0)
@@ -1877,6 +2005,68 @@ def _validate_glo30_section(pack_dir, pack, elev, err):
         err("h_at interior probe not finite")
 
 
+def _validate_procedural_section(pack_dir, pack, elev, err):
+    """procedural elevation: block shape (no tile/licence DEM provenance),
+    seed match with pack.json, terrain.bin consistency against pack.json,
+    and grid h_at spot checks. Generator determinism/seed-sensitivity is the
+    tests' job; this asserts only self-consistency."""
+    if elev.get("datum") != "origin_ground":
+        err(f"elevation datum {elev.get('datum')!r} != 'origin_ground'")
+    if elev.get("step_m") != TERRAIN_STEP_M:
+        err(f"elevation step_m {elev.get('step_m')!r} != {TERRAIN_STEP_M}")
+    for k in ("licence", "tiles"):
+        if elev.get(k) is not None:
+            err(f"elevation {k} set on the procedural model (DEM-only)")
+    if elev.get("seed") != pack.get("seed"):
+        err(f"elevation seed {elev.get('seed')!r} != pack seed "
+            f"{pack.get('seed')!r}")
+    for k in ("cols", "rows"):
+        if not isinstance(elev.get(k), int) or elev[k] < 2:
+            err(f"elevation {k} not an int >= 2")
+    span = pack.get("ground", {}).get("span_m", 0.0)
+    for k in ("origin_x", "origin_y"):
+        want = -span / 2.0
+        if elev.get(k) != want:
+            err(f"elevation {k} {elev.get(k)!r} != {want!r}")
+    for k in ("z_min", "z_max"):
+        v = elev.get(k)
+        if not isinstance(v, (int, float)) or not math.isfinite(v):
+            err(f"elevation {k} not finite: {v!r}")
+    if isinstance(elev.get("z_min"), float) and isinstance(elev.get("z_max"), float) \
+            and elev["z_min"] >= elev["z_max"]:
+        # the fBm spans real relief; a flat field would be a generator bug
+        err("elevation z_min >= z_max (procedural relief must vary)")
+    sha = elev.get("sha256", "")
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        err(f"elevation.sha256 not sha256 hex: {sha!r}")
+    if isinstance(elev.get("cols"), int) and isinstance(elev.get("step_m"), float) \
+            and (elev["cols"] - 1) * elev["step_m"] != span:
+        err(f"grid footprint (cols-1)*step != span_m {span!r}")
+    grid = _validate_terrain_bin(os.path.join(pack_dir, "terrain.bin"), elev, err)
+    if grid is None:
+        return
+    with open(os.path.join(pack_dir, "terrain.bin"), "rb") as f:
+        terrain_sha = hashlib.sha256(f.read()).hexdigest()
+    if terrain_sha != elev.get("sha256"):
+        err(f"elevation.sha256 {elev.get('sha256')!r} != terrain.bin sha256")
+    nodes = [(0, 0), (0, grid["rows"] - 1), (grid["cols"] - 1, 0),
+             (grid["cols"] - 1, grid["rows"] - 1),
+             (grid["cols"] // 2, grid["rows"] // 2),
+             (0, grid["rows"] // 2), (grid["cols"] // 2, 0),
+             (grid["cols"] - 1, grid["rows"] // 2),
+             (grid["cols"] // 2, grid["rows"] - 1)]
+    for i, j in nodes:
+        x = grid["origin_x"] + i * grid["step"]
+        y = grid["origin_y"] + j * grid["step"]
+        if terrain_h_at(grid, x, y) != grid["z"][j][i]:
+            err(f"h_at node ({i}, {j}) != grid z")
+    ci, cj = grid["cols"] // 2, grid["rows"] // 2
+    x = grid["origin_x"] + (ci + 0.5) * grid["step"]
+    y = grid["origin_y"] + (cj + 0.5) * grid["step"]
+    if not math.isfinite(terrain_h_at(grid, x, y)):
+        err("h_at interior probe not finite")
+
+
 def _round1(v):
     return round(v, 1)
 
@@ -1962,9 +2152,17 @@ def main(argv=None):
     ap.add_argument("--out", help="output pack directory")
     ap.add_argument("--fetch", type=float, metavar="RADIUS_M",
                     help="live Overpass fetch (network) instead of --osm")
-    ap.add_argument("--elevation", default="flat", choices=("flat", "glo30"),
-                    help="elevation model: flat (z=0) or glo30 (Copernicus DEM "
-                         "30 m sampled onto a node grid + terrain.bin sidecar)")
+    ap.add_argument("--elevation", default="flat",
+                    choices=("flat", "glo30", "procedural"),
+                    help="elevation model: flat (z=0), glo30 (Copernicus DEM "
+                         "30 m sampled onto a node grid + terrain.bin "
+                         "sidecar), or procedural (seeded value-noise fBm + "
+                         "terrain.bin sidecar; runs with no --osm/--fetch, "
+                         "then --span sizes the playground)")
+    ap.add_argument("--span", type=float, metavar="M",
+                    help="ground edge in metres for a procedural build "
+                         "without --osm/--fetch (required then; feature "
+                         "builds derive the span from the scene)")
     ap.add_argument("--dem-file", help="offline DEM GeoTIFF path (glo30): "
                     "build from this file instead of the tile mirror")
     ap.add_argument("--dem-cache", help="directory for GLO-30 tile cache "
@@ -1986,6 +2184,7 @@ def main(argv=None):
 
     fetched = None
     fetch_sha = ""
+    osm_used = args.fetch is not None or args.osm is not None
     if args.fetch:
         data, endpoint, date_iso, fetch_sha = fetch_osm(
             args.lat, args.lon, args.fetch, args.osm)
@@ -1993,8 +2192,19 @@ def main(argv=None):
     elif args.osm:
         with open(args.osm) as f:
             data = json.load(f)
+    elif args.elevation == "procedural":
+        # no usable OSM data: the playground is --span sized ground over a
+        # seeded fBm relief, no features
+        if args.span is None:
+            ap.error("--elevation procedural without --osm needs --span M "
+                     "(playground edge in metres)")
+        data = {"elements": []}
     else:
-        ap.error("need --osm CACHE.json or --fetch RADIUS_M")
+        ap.error("need --osm CACHE.json or --fetch RADIUS_M (or --elevation "
+                 "procedural with --span)")
+    if args.span is not None and osm_used:
+        ap.error("--span applies only to a procedural build without "
+                 "--osm/--fetch (feature builds derive the span)")
     if not args.out:
         ap.error("need --out DIR")
 
@@ -2044,6 +2254,42 @@ def main(argv=None):
               f"{grid['z_max']:+.1f} m (datum = DEM height at the grid origin)")
         for t in grid["tiles"]:
             print(f"terrain tile: {t['name']} sha256 {t['sha256'][:12]}...")
+
+    elif args.elevation == "procedural":
+        # seeded fBm relief: same bin/h_at/datum path as glo30, no DEM
+        # provenance (tiles stay empty); with no OSM the span/bounds stamps
+        # come from --span
+        span_req = pack["ground"]["span_m"] if osm_used else args.span
+        grid = build_terrain_grid_procedural(span_req, args.seed)
+        pack["ground"]["span_m"] = round((grid["cols"] - 1) * TERRAIN_STEP_M, 3)
+        if not osm_used:
+            half = pack["ground"]["span_m"] / 2.0
+            pack["bounds"] = {"min_x": -half, "max_x": half,
+                              "min_y": -half, "max_y": half}
+        os.makedirs(args.out, exist_ok=True)
+        terrain_path = os.path.join(args.out, "terrain.bin")
+        write_terrain_bin(terrain_path, grid)
+        with open(terrain_path, "rb") as f:
+            terrain_sha = hashlib.sha256(f.read()).hexdigest()
+        pack["elevation"] = {
+            "model": "procedural",
+            "datum": "origin_ground",
+            "step_m": grid["step"],
+            "cols": grid["cols"],
+            "rows": grid["rows"],
+            "origin_x": grid["origin_x"],
+            "origin_y": grid["origin_y"],
+            "z_min": grid["z_min"],
+            "z_max": grid["z_max"],
+            "sha256": terrain_sha,
+            "seed": args.seed,
+        }
+        attr_note = "procedural terrain (seed %d)" % args.seed
+        pack["attribution"] = (ATTRIBUTION + " | " + attr_note
+                               if osm_used else attr_note)
+        print(f"terrain: {grid['cols']}x{grid['rows']} nodes @ "
+              f"{grid['step']:.0f} m, fBm relief z {grid['z_min']:+.1f}.."
+              f"{grid['z_max']:+.1f} m (datum = node (0,0), seed {args.seed})")
 
     water, water_notes = solve_water(coast_open, coast_closed,
                                      water_rings, pack["ground"]["span_m"] / 2.0)

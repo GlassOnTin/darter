@@ -28,6 +28,16 @@
 //! The tool is stdlib-only Python (no pinned interpreter — provenance lives
 //! in the pack itself: input sha256 + seed + origin, and the byte-identity
 //! gate re-runs here with whatever interpreter builds the pack).
+//!
+//! Procedural relief: `--elevation procedural --seed N --span M` builds a
+//! featureless playground (no --osm/--fetch needed) — a pure-hash value-noise
+//! fBm grid in the same terrain.bin/origin-datum shape as glo30, so the
+//! core and loader read it unchanged; provenance is the seed itself
+//! (`elevation.seed == pack.seed`, validator-checked) and with no OSM input
+//! `source` carries no osm_json_sha256, so the ODbL credit line switches to
+//! "procedural terrain (seed N)". Procedural may also compose with a real
+//! OSM build when the DEM is unusable: features over fBm relief, both
+//! credits in one attribution string.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -223,23 +233,23 @@ fn read_pack_text(dir: &Path) -> String {
 /// add the model-specific elevation block and span identity. Returns the
 /// span derived from the bounds (2*max extent + GROUND_PAD).
 fn assert_common_metadata(text: &str, dir: &Path) -> f64 {
-    assert_eq!(str_in(text, "schema"), "darter_area_pack");
+    assert_eq!(str_in(&text, "schema"), "darter_area_pack");
     // v3: glo30 elevation object + terrain.bin sidecar (M1, 2026-10-01).
-    assert!((num_in(text, "version") - 3.0).abs() < f64::EPSILON);
-    assert!(str_in(text, "attribution").contains("OpenStreetMap"));
-    assert!((num_in(text, "seed") - SEED as f64).abs() < f64::EPSILON);
+    assert!((num_in(&text, "version") - 3.0).abs() < f64::EPSILON);
+    assert!(str_in(&text, "attribution").contains("OpenStreetMap"));
+    assert!((num_in(&text, "seed") - SEED as f64).abs() < f64::EPSILON);
 
     // provenance: the recorded input sha256 must match the fixture bytes
     let fixture = std::fs::read(FIXTURE).expect("read fixture");
     let mut h = darter_core::sha256::Sha256::new();
     h.update(&fixture);
     let got = darter_core::sha256::to_hex(&h.finish());
-    assert_eq!(str_in(text, "osm_json_sha256"), got, "input sha256 mismatch");
-    assert!((num_in(text, "origin_lat") - HOME_LAT).abs() < 1e-9);
-    assert!((num_in(text, "origin_lon") - HOME_LON).abs() < 1e-9);
+    assert_eq!(str_in(&text, "osm_json_sha256"), got, "input sha256 mismatch");
+    assert!((num_in(&text, "origin_lat") - HOME_LAT).abs() < 1e-9);
+    assert!((num_in(&text, "origin_lon") - HOME_LON).abs() < 1e-9);
 
     // counts vs arrays (ids are one letter + index per element family)
-    let counts = json_object(text, "counts");
+    let counts = json_object(&text, "counts");
     let counts_b = num_in(counts, "buildings") as usize;
     let counts_r = num_in(counts, "roads") as usize;
     let counts_s = num_in(counts, "strips") as usize;
@@ -256,7 +266,7 @@ fn assert_common_metadata(text: &str, dir: &Path) -> f64 {
     assert!(counts_b > MIN_BUILDINGS, "buildings {counts_b} below floor");
 
     // bounds vs derived ground span; scene stays near the origin
-    let bounds = json_object(text, "bounds");
+    let bounds = json_object(&text, "bounds");
     let min_x = num_in(bounds, "min_x");
     let max_x = num_in(bounds, "max_x");
     let min_y = num_in(bounds, "min_y");
@@ -285,16 +295,16 @@ fn assert_common_metadata(text: &str, dir: &Path) -> f64 {
 /// Flat-pack metadata: elevation == flat and the GROUND_PAD span formula.
 fn assert_metadata(text: &str, dir: &Path) {
     let derived = assert_common_metadata(text, dir);
-    let elevation = json_object(text, "elevation");
+    let elevation = json_object(&text, "elevation");
     assert_eq!(str_in(elevation, "model"), "flat");
-    let stored = num_in(text, "span_m");
+    let stored = num_in(&text, "span_m");
     assert!((stored - derived).abs() < 0.01, "span {stored} vs derived {derived}");
 }
 
 /// Fixture-only provenance (assert_glo30_metadata is shared with the live
 /// test, whose tile name and sha differ).
 fn assert_dem_fixture_recorded(text: &str) {
-    let elevation = json_object(text, "elevation");
+    let elevation = json_object(&text, "elevation");
     assert!(
         elevation.contains("\"name\": \"dem_home_area.tif\""),
         "fixture tile name not recorded in the elevation block"
@@ -310,11 +320,11 @@ fn assert_dem_fixture_recorded(text: &str) {
 /// which only rounds the derived span UP.
 fn assert_glo30_metadata(text: &str, dir: &Path) {
     let derived = assert_common_metadata(text, dir);
-    let elevation = json_object(text, "elevation");
+    let elevation = json_object(&text, "elevation");
     assert_eq!(str_in(elevation, "model"), "glo30");
     assert_eq!(str_in(elevation, "datum"), "origin_ground");
     assert!(str_in(elevation, "licence").contains("Copernicus"));
-    assert!(str_in(text, "attribution").contains("Copernicus DEM"));
+    assert!(str_in(&text, "attribution").contains("Copernicus DEM"));
 
     let cols = num_in(elevation, "cols") as usize;
     let rows = num_in(elevation, "rows") as usize;
@@ -343,7 +353,7 @@ fn assert_glo30_metadata(text: &str, dir: &Path) {
 
     // snapped span: exact (cols-1)*step identity, at most one node step
     // above the derived span, never below it
-    let stored = num_in(text, "span_m");
+    let stored = num_in(&text, "span_m");
     assert!(
         (stored - (cols - 1) as f64 * step).abs() < 0.001,
         "span {stored} != (cols-1)*step {}",
@@ -424,7 +434,216 @@ fn area_pack_demfile_glo30_byte_identical_rebuild() {
     let _ = std::fs::remove_dir_all(&b);
 }
 
-/// The drape consumes no RNG: the seeded scene streams (grass scatter,
+// ---- procedural fallback terrain (M1) ---------------------------------------
+//
+// --elevation procedural builds a valid pack with NO Overpass input: the
+// relief grid comes from a seeded pure-stdlib value-noise fBm instead of the
+// DEM, and --span (required in the no-OSM build) sizes the playground. The
+// elevation block carries the generator seed instead of DEM tile shas, and
+// the attribution says what the pack actually contains — no OpenStreetMap or
+// Copernicus credit where there is no OSM or DEM data. The Rust core reads
+// only terrain.bin + pack.json fields shared with glo30, so no core or
+// loader change rides along.
+
+fn build_pack_procedural_seed(dir: &Path, seed: &str, arg: &str) {
+    let (ok, stdout, stderr) = run({
+        let mut c = tool();
+        c.args(["--elevation", "procedural", "--seed", seed, "--span", arg, "--out"])
+            .arg(dir);
+        c
+    });
+    assert!(ok, "procedural build failed: {stdout}{stderr}");
+    println!("build procedural: {stdout}");
+}
+
+fn build_pack_procedural(dir: &Path, arg: &str) {
+    build_pack_procedural_seed(dir, "17", arg)
+}
+
+#[test]
+fn area_pack_procedural_no_osm_build_validate() {
+    let dir = temp_dir("proc");
+    build_pack_procedural(&dir, "1024");
+    let (ok, _out, err) = validate(&dir);
+    assert!(ok, "validator rejected the procedural pack: {err}");
+
+    let text = read_pack_text(&dir);
+    assert_eq!(str_in(&text, "schema"), "darter_area_pack");
+    assert!((num_in(&text, "version") - 3.0).abs() < f64::EPSILON);
+    // attribution reflects the pack's contents: no OSM or DEM credit here
+    let attr = str_in(&text, "attribution");
+    assert!(attr.contains("procedural"), "attribution {attr} omits procedural");
+    assert!(
+        !attr.contains("OpenStreetMap") && !attr.contains("Copernicus"),
+        "attribution credits data the pack does not carry: {attr}"
+    );
+    // json_value anchors at the top-level member (elevation carries a nested
+    // "seed" too); parse its bare-number text
+    let seed_text = json_value(&text, "seed");
+    assert_eq!(
+        seed_text.trim().parse::<f64>().expect("seed numeric"),
+        17.0,
+        "seed {seed_text} != 17"
+    );
+    let src = json_object(&text, "source");
+    assert!(!src.contains("osm_json_sha256"), "no OSM input to hash in {src}");
+    assert_eq!(str_in(&text, "frame"), "metres, x=east y=north z=up, origin at (source.origin_lat, source.origin_lon)");
+
+    // empty scene: no feature groups, ground only
+    let counts = json_object(&text, "counts");
+    assert!(
+        !counts.chars().any(|c| c.is_ascii_digit() && c != '0'),
+        "non-zero counts in a no-OSM pack: {counts}"
+    );
+    let obj = std::fs::read_to_string(dir.join("scene.obj")).expect("scene.obj");
+    for fam in [
+        "o bld_",
+        "o bldroof_",
+        "o road_",
+        "o hedge_",
+        "o fence_",
+        "o grass_",
+        "o tree_",
+        "o treec_",
+        "o dash_",
+        "o water_",
+    ] {
+        assert_eq!(count_lines(&obj, fam), 0, "{fam} groups in a no-OSM pack");
+    }
+    assert!(obj.lines().any(|l| l == "o ground"));
+    assert!(obj.lines().any(|l| l.starts_with("v ")), "no vertices");
+
+    // elevation block: procedural model with real relief, grid-shape
+    // identity, datum node 0.0, no DEM tiles
+    let elevation = json_object(&text, "elevation");
+    assert_eq!(str_in(elevation, "model"), "procedural");
+    assert_eq!(str_in(elevation, "datum"), "origin_ground");
+    assert!(
+        !elevation.contains("licence") && !elevation.contains("\"name\""),
+        "procedural elevation carries DEM provenance: {elevation}"
+    );
+    let z_min = num_in(elevation, "z_min");
+    let z_max = num_in(elevation, "z_max");
+    assert!(z_min < z_max, "no relief in the procedural grid {z_min}..{z_max}");
+    assert!(
+        (-200.0..200.0).contains(&z_min) && (-200.0..200.0).contains(&z_max),
+        "insane procedural relief z {z_min}..{z_max}"
+    );
+    let cols = num_in(elevation, "cols") as usize;
+    let rows = num_in(elevation, "rows") as usize;
+    let step = num_in(elevation, "step_m");
+    assert!(cols >= 2 && rows >= 2, "degenerate grid {cols}x{rows}");
+    assert!((step - 30.0).abs() < f64::EPSILON, "step {step}");
+    let snapped = (cols - 1) as f64 * step;
+    let stored = num_in(&text, "span_m");
+    assert!(
+        (stored - snapped).abs() < 0.001,
+        "span {stored} != (cols-1)*step {snapped}"
+    );
+    assert!(stored >= 1024.0 - 0.001, "span {stored} snapped below requested");
+    let bin = std::fs::read(dir.join("terrain.bin")).expect("terrain.bin");
+    assert_eq!(bin.len(), 56 + 8 * cols * rows);
+    let z00 = f64::from_le_bytes(bin[56..64].try_into().expect("8 bytes"));
+    assert!((z00 - 0.0).abs() < f64::EPSILON, "datum node not 0.0: {z00}");
+    // ±span/2 bounds stamped from the snapped span (no features to derive
+    // them from)
+    let bounds = json_object(&text, "bounds");
+    let half = stored / 2.0;
+    for k in ["min_x", "max_x", "min_y", "max_y"] {
+        assert!(
+            (num_in(bounds, k) - if k.starts_with("max") { half } else { -half }).abs() < 0.001,
+            "bounds.{k} off the span box"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn area_pack_procedural_determinism_seed_sensitive() {
+    let a = temp_dir("proc-byte-a");
+    let b = temp_dir("proc-byte-b");
+    let c = temp_dir("proc-seed18");
+    build_pack_procedural(&a, "1024");
+    build_pack_procedural(&b, "1024");
+    for name in ["pack.json", "scene.obj", "terrain.bin"] {
+        let fa = std::fs::read(a.join(name)).expect(name);
+        let fb = std::fs::read(b.join(name)).expect(name);
+        assert_eq!(fa, fb, "{name} not byte-identical across procedural rebuilds");
+        assert!(!fa.is_empty());
+    }
+    // a different seed changes the relief (seed lives in the noise lattice)
+    let text_b = read_pack_text(&b);
+    build_pack_procedural_seed(&c, "18", "1024");
+    let bin_b = std::fs::read(b.join("terrain.bin")).expect("b terrain.bin");
+    let bin_c = std::fs::read(c.join("terrain.bin")).expect("c terrain.bin");
+    assert_ne!(bin_b, bin_c, "seed 18 produced the same relief as seed 17");
+    let text_c = read_pack_text(&c);
+    let e_b = json_object(&text_b, "elevation");
+    let e_c = json_object(&text_c, "elevation");
+    assert_ne!(e_b, e_c, "elevation blocks identical across seeds");
+    // the seed is recorded in the elevation provenance, not just pack.seed
+    assert!(e_c.contains("\"seed\": 18"), "procedural seed unrecorded: {e_c}");
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
+#[test]
+fn area_pack_procedural_composes_with_osm() {
+    // fixture OSM features over a procedural relief grid: the composition
+    // the fallback exists for (OSM present but DEM unusable) — attribution
+    // gains both credits, the glo30 section stays absent, and the scene
+    // streams flow exactly as they would with flat elevation
+    let dir = temp_dir("proc-osm");
+    let flat = temp_dir("proc-osm-flat");
+    let (ok, stdout, stderr) = run({
+        let mut c = tool();
+        c.args([
+            "--osm",
+            FIXTURE,
+            "--lat",
+            &HOME_LAT.to_string(),
+            "--lon",
+            &HOME_LON.to_string(),
+            "--seed",
+            &SEED.to_string(),
+            "--elevation",
+            "procedural",
+            "--out",
+        ])
+        .arg(&dir);
+        c
+    });
+    assert!(ok, "procedural+OSM build failed: {stdout}{stderr}");
+    build_pack(&flat);
+    let (vok, _vout, verr) = validate(&dir);
+    assert!(vok, "validator rejected the procedural+OSM pack: {verr}");
+
+    let text = read_pack_text(&dir);
+    let attr = str_in(&text, "attribution");
+    assert!(
+        attr.contains("OpenStreetMap") && attr.contains("procedural"),
+        "combined attribution missing a credit: {attr}"
+    );
+    assert!(
+        !attr.contains("Copernicus"),
+        "attribution credits a DEM the pack does not use: {attr}"
+    );
+    let elevation = json_object(&text, "elevation");
+    assert_eq!(str_in(elevation, "model"), "procedural");
+    // the scene streams are untouched by the elevation model: counts,
+    // buildings, trees and the OSM provenance match the flat build
+    let flat_text = read_pack_text(&flat);
+    for key in ["counts", "buildings", "trees", "source"] {
+        assert_eq!(
+            json_value(&text, key),
+            json_value(&flat_text, key),
+            "{key} diverged between flat and procedural (grid consumed RNG?)"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&flat);
+}
 /// building mats, tree params) must produce the same arrays whether the
 /// geometry is flat or draped, so a glo30 build keeps today's scene and
 /// only the elevation block, the snapped span, and the attribution differ.
