@@ -78,12 +78,16 @@ jobs:
         run: |
           cp -a tools/godot_smoke "$RUNNER_TEMP/export"
           rm -rf "$RUNNER_TEMP/export/build"
-          # The M2a live-plant probe is desktop-only: live_probe.* reference
-          # the DarterQuad GDExtension class and ext/ carries the desktop
-          # .so (gitignored, but present locally) — not verified against an
+          # The M2a/M2b probes are desktop-only: live_probe.* references the
+          # DarterQuad GDExtension class, fly_probe.* the DarterFlyer class
+          # (and a desktop SITL binary path); ext/ carries the desktop .so
+          # (gitignored, but present locally) — not verified against an
           # Android export, so the copy strips all of it.
           rm -rf "$RUNNER_TEMP/export/ext" \
-            "$RUNNER_TEMP/export/live_probe.gd" "$RUNNER_TEMP/export/live_probe.tscn"
+            "$RUNNER_TEMP/export/live_probe.gd" "$RUNNER_TEMP/export/live_probe.tscn" \
+            "$RUNNER_TEMP/export/live_probe.gd.uid" \
+            "$RUNNER_TEMP/export/fly_probe.gd" "$RUNNER_TEMP/export/fly_probe.tscn" \
+            "$RUNNER_TEMP/export/fly_probe.gd.uid"
           sed -i 's#run/main_scene="res://replay.tscn"#run/main_scene="res://area_picker.tscn"#' \
             "$RUNNER_TEMP/export/project.godot"
           cp tools/godot_smoke/refresh_vote/refresh_vote.aar "$RUNNER_TEMP/export/addons/refresh_vote/"

@@ -3,80 +3,32 @@
 //! Betaflight SITL child (closed mode), recording both to the darter_record
 //! JSONL format plus a summary.json of facts and provenance.
 //!
-//! Closed-mode contract:
-//! - The SITL binary is spawned as a child in a FRESH working directory
-//!   (<out>/sitl_cwd): the SITL writes eeprom.bin into its cwd, so a fresh
-//!   directory boots factory defaults and profile application cannot leak
-//!   between runs.
-//! - The config profile is applied over the MSPv2 CLI **without save** (RAM
-//!   only), then read back with `diff`; the run refuses to start flying until
-//!   every profile line is present in the readback.
-//! - Loop shape: 250 Hz fdm/RC ticks, 32 x 125 us core substeps per tick,
-//!   wall-clock paced. MSP telemetry runs on a dedicated thread that owns
-//!   the link (the SITL serves exactly one TCP client per UART — verified
-//!   serial_tcp.c:76): ATTITUDE+MOTOR at 25 Hz, STATUS at 4 Hz. Polls cost
-//!   15-30 ms each on this build, far over the 4 ms tick budget, so inline
-//!   polling stretched the loop to 2x wall time (observed 2026-09-28);
-//!   off-thread the flight loop keeps real time.
-//! - RC script is a state machine driven by observed FC status, not a fixed
-//!   timeline: hold the arm box DOWN until arming_disable clears (the FC
-//!   blocks arming for pwr_on_arm_grace = 5 s after boot; holding the box
-//!   active during any disable flag latches ARMING_DISABLED_ARM_SWITCH,
-//!   observed), raise the box, wait for ARM box + flags clear, then ramp
-//!   throttle (default 0.16, near hover) over 0.5 s.
+//! The closed-mode runner itself lives in darter_core::flyer (M2b), shared
+//! verbatim with the Godot DarterFlyer class; its contract notes are there.
 //!
 //! Loop-time instrumentation: per-tick wall duration is collected and written
 //! to summary.json as p50/p99/max (VISION M0: frame-time instrumentation from
 //! the first commit).
 
 use std::io::{BufWriter, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use darter_core::air::RHO_0;
-use darter_core::flight::{
-    pct, write_sample, CoreFlight, CoreSetup, SUBSTEPS_PER_TICK, SUBSTEP_DT, TICK_DT,
-};
-use darter_core::msp::{
-    decode_attitude, decode_estimated_altitude, decode_motor, decode_raw_imu, decode_status,
-    MspLink, MSP_ALTITUDE, MSP_ATTITUDE, MSP_MOTOR, MSP_RAW_IMU, MSP_STATUS,
-};
+use darter_core::flight::{CoreFlight, CoreSetup, SUBSTEP_DT, TICK_DT};
+use darter_core::flyer::{DEFAULT_SITL_BIN, DEFAULT_THROTTLE, Flyer, FlyerConfig};
 use darter_core::preset::Preset;
-use darter_core::quad::{hover_throttle, Quad};
-use darter_core::record::{FcSample, RecordHeader, RecordWriter, SitlProvenance};
+use darter_core::quad::hover_throttle;
 use darter_core::sha256::sha256_hex;
-use darter_core::sensor::{SensorConfig, SensorModel};
-use darter_core::sitl::{fdm_from_state, fdm_from_state_imu, rc_packet, SimLink};
-use darter_core::terrain::{Ground, TerrainGrid};
-use darter_core::wind::{WindConfig, WindModel};
+use darter_core::sensor::SensorConfig;
+use darter_core::terrain::TerrainGrid;
+use darter_core::wind::WindConfig;
 use darter_core::DVec3;
 
 mod track;
 
-const MSP_ADDR: &str = "127.0.0.1:5761";
-const SITL_MSP_PORT: u16 = 5761;
-
-const DEFAULT_BIN: &str = "/tmp/betaflight/obj/betaflight_2026.12.0-alpha_SITL";
-const DEFAULT_PROFILE: &str = "aux 0 0 2 1700 2100 0 0";
-const DEFAULT_THROTTLE: f64 = 0.16; // closed-loop scripted throttle (hover ~0.155 at full pack)
-const ARMED_US: u16 = 2000;
-const DISARMED_US: u16 = 1000;
-
 /// Default closed duration covers the 5 s boot grace, the arming window,
 /// the throttle ramp, and ~5 s of powered flight.
 const CLOSED_DEFAULT_DURATION: f64 = 12.0;
-
-/// Telemetry cadence (dedicated thread).
-const TELEM_ATT_PERIOD: Duration = Duration::from_millis(40); // 25 Hz
-const TELEM_STATUS_PERIOD: Duration = Duration::from_millis(250); // 4 Hz
-
-/// Arming state-machine timeouts (sim time).
-const GRACE_TIMEOUT_S: f64 = 20.0; // grace clears at 5 s FC time; 4x slack
-const ARM_TIMEOUT_S: f64 = 10.0; // from box-up to armed
 
 struct Args {
     mode: String,
@@ -144,7 +96,7 @@ fn parse_args() -> Result<Args, String> {
         out: "run".into(),
         profile: None,
         determinism_check: false,
-        bin: DEFAULT_BIN.into(),
+        bin: DEFAULT_SITL_BIN.into(),
         throttle: DEFAULT_THROTTLE,
         core_throttle: None,
         alt: 0.5,
@@ -297,6 +249,7 @@ struct SitlInfo {
     bin: String,
     sha256: String,
     version: String,
+    #[allow(dead_code)] // the applied lines ride the record header; summary keeps only the verdict below
     profile: Vec<String>,
     profile_readback_ok: bool,
 }
@@ -519,499 +472,62 @@ fn run_core(
     })
 }
 
-/// Closed-mode flight: spawn + supervise a SITL child, apply the profile in
-/// RAM, read it back, fly the scripted RC against the closed loop, record.
+/// Closed-mode flight: the runner now lives in darter_core::flyer (lifted
+/// from this binary in M2b so the Godot DarterFlyer class drives the
+/// identical code); this wrapper only maps the CLI args onto FlyerConfig.
 fn run_closed(args: &Args, terrain: Option<&TerrainGrid>) -> Result<RunOutcome, String> {
-    let duration = args.duration.unwrap_or(8.0);
+    let duration = args.duration.unwrap_or(CLOSED_DEFAULT_DURATION);
     let out_dir = PathBuf::from(&args.out);
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("out dir: {e}"))?;
-
-    // Provenance: hash of the binary that will run.
-    let bin_bytes =
-        std::fs::read(&args.bin).map_err(|e| format!("SITL binary {}: {e}", args.bin))?;
-    let bin_sha = sha256_hex(&bin_bytes);
-    println!("[sim_run] SITL binary {} sha256 {bin_sha}", args.bin);
-
-    // A leftover SITL on the fixed ports would eat our fdm/RC/MSP traffic.
-    if TcpStream::connect_timeout(
-        &SocketAddr::from((Ipv4Addr::LOCALHOST, SITL_MSP_PORT)),
-        Duration::from_millis(200),
-    )
-    .is_ok()
-    {
-        return Err(format!("port {SITL_MSP_PORT} already in use: another SITL is running; stop it first"));
-    }
-
-    // Fresh working directory -> factory defaults (eeprom.bin lives in cwd).
-    let sitl_cwd = out_dir.join("sitl_cwd");
-    if sitl_cwd.exists() {
-        std::fs::remove_dir_all(&sitl_cwd).map_err(|e| format!("sitl cwd wipe: {e}"))?;
-    }
-    std::fs::create_dir(&sitl_cwd).map_err(|e| format!("sitl cwd: {e}"))?;
-    let log_out = std::fs::File::create(out_dir.join("sitl_stdout.log"))
-        .map_err(|e| format!("sitl log: {e}"))?;
-    let log_err = log_out.try_clone().map_err(|e| format!("sitl log: {e}"))?;
-
-    let mut proc_guard = SitlProc {
-        child: Some(
-            Command::new(&args.bin)
-                .current_dir(&sitl_cwd)
-                .stdout(Stdio::from(log_out))
-                .stderr(Stdio::from(log_err))
-                .spawn()
-                .map_err(|e| format!("spawn SITL: {e}"))?,
-        ),
+    let cfg = FlyerConfig {
+        sitl_bin: args.bin.clone().into(),
+        profile: args.profile.clone(),
+        seed: args.seed,
+        duration_s: duration,
+        throttle: args.throttle,
+        yaw: args.yaw,
+        yaw_until: args.yaw_until,
+        pitch: args.pitch,
+        pitch_until: args.pitch_until,
+        roll: args.roll,
+        roll_until: args.roll_until,
+        gps_stale: args.gps_stale,
+        sensor_cfg: args.sensor_cfg.clone(),
+        wind_cfg: args.wind_cfg,
+        terrain: terrain.cloned(),
     };
-    let pid = proc_guard.child.as_ref().unwrap().id();
-    println!("[sim_run] SITL pid {pid}, cwd {}", sitl_cwd.display());
-
-    let mut link = wait_msp_ready(&mut proc_guard)?;
-
-    // Profile: RAM only (no save; the fresh cwd has defaults on disk anyway).
-    let profile: Vec<String> = args
-        .profile
-        .as_deref()
-        .unwrap_or(DEFAULT_PROFILE)
-        .split(';')
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
-    for line in &profile {
-        link.cli(line).map_err(|e| format!("profile apply {line:?}: {e}"))?;
-    }
-
-    // Readback before flying: the profile must be verifiably live.
-    let diff = link.cli("diff").map_err(|e| format!("diff readback: {e}"))?;
-    let version = link.cli("version").map_err(|e| format!("version readback: {e}"))?;
-    let mut profile_readback_ok = true;
-    for line in &profile {
-        if !diff.contains(line.as_str()) {
-            eprintln!("[sim_run] profile line missing from diff readback: {line}");
-            profile_readback_ok = false;
-        }
-    }
-    let version_line = version
-        .lines()
-        .find(|l| l.contains("Betaflight /"))
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if version_line.is_empty() {
-        return Err(format!("no version line in CLI readback: {version:?}"));
-    }
-    println!("[sim_run] readback: {version_line}");
-    if !profile_readback_ok {
-        return Err("profile readback failed; refusing to fly with unverified config".into());
-    }
-
-    let info = SitlInfo {
-        bin: args.bin.clone(),
-        sha256: bin_sha,
-        version: version_line,
-        profile,
-        profile_readback_ok,
-    };
-    fly_closed(args, link, duration, &out_dir, info, terrain)
-}
-
-/// Latest-snapshot store for the telemetry thread.
-#[derive(Default)]
-struct TelemState {
-    latest: Option<FcSample>,
-    seq: u64, // bumped whenever `latest` changes
-    status: Vec<(f64, u32, u32)>,
-    errors: u64,
-}
-
-/// MSP telemetry thread: owns the link (the SITL serves one TCP client per
-/// UART) and polls ATTITUDE+MOTOR at 25 Hz and STATUS at 4 Hz. Each request
-/// costs 15-30 ms on this build — far over the 4 ms tick budget — so the
-/// flight loop only reads this thread's shared snapshot. Runs until `stop`.
-fn spawn_telemetry(
-    mut link: MspLink,
-    started: Instant,
-    stop: Arc<AtomicBool>,
-) -> (Arc<Mutex<TelemState>>, std::thread::JoinHandle<()>) {
-    let shared = Arc::new(Mutex::new(TelemState::default()));
-    let sh = Arc::clone(&shared);
-    let handle = std::thread::spawn(move || {
-        let mut next_att = started + TELEM_ATT_PERIOD;
-        let mut next_status = started + TELEM_STATUS_PERIOD;
-        let norm = |v: u16| ((v as f64 - 1000.0) / 1000.0).clamp(0.0, 1.0) as f32;
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let now = Instant::now();
-            if now >= next_att {
-                next_att += TELEM_ATT_PERIOD;
-                let att = link.request_v1(MSP_ATTITUDE).map(|p| decode_attitude(&p));
-                let motors = link.request_v1(MSP_MOTOR).map(|p| decode_motor(&p));
-                let imu = link.request_v1(MSP_RAW_IMU).map(|p| decode_raw_imu(&p));
-                let alt = link.request_v1(MSP_ALTITUDE).map(|p| decode_estimated_altitude(&p));
-                let mut st = sh.lock().unwrap();
-                if let (Ok(Some(a)), Ok(m), Ok(Some(i)), Ok(Some(alt))) = (att, motors, imu, alt) {
-                    let (arm, flags) = st.status.last().map(|s| (s.1, s.2)).unwrap_or((0, 0));
-                    st.latest = Some(FcSample {
-                        att_cdeg: [a.roll_decdeg as i32, a.pitch_decdeg as i32, a.yaw_deg as i32],
-                        motors: [
-                            norm(*m.first().unwrap_or(&1000)),
-                            norm(*m.get(1).unwrap_or(&1000)),
-                            norm(*m.get(2).unwrap_or(&1000)),
-                            norm(*m.get(3).unwrap_or(&1000)),
-                        ],
-                        gyro_raw: [
-                            i.gyro_raw[0] as f64,
-                            i.gyro_raw[1] as f64,
-                            i.gyro_raw[2] as f64,
-                        ],
-                        alt_cm: alt.alt_cm,
-                        vario_cms: alt.vario_cms,
-                        arming_disable: arm,
-                        flight_flags: flags,
-                    });
-                    st.seq += 1;
-                } else {
-                    st.errors += 1;
-                }
-            }
-            if now >= next_status {
-                next_status += TELEM_STATUS_PERIOD;
-                match link.request_v1(MSP_STATUS) {
-                    Ok(p) => {
-                        let mut st = sh.lock().unwrap();
-                        match decode_status(&p) {
-                            Some(s) => {
-                                let t = started.elapsed().as_secs_f64();
-                                st.status.push((t, s.arming_disable_flags, s.flight_flags));
-                            }
-                            None => st.errors += 1,
-                        }
-                    }
-                    Err(_) => {
-                        sh.lock().unwrap().errors += 1;
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    });
-    (shared, handle)
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ArmPhase {
-    WaitGrace,
-    WaitArmed,
-    Fly,
-}
-
-/// Throttle ramp after the ARM box goes up.
-const SETTLE_S: f64 = 0.25;
-const RAMP_S: f64 = 0.5;
-
-/// Fly the closed loop from the already-configured link, which is moved into
-/// the telemetry thread. Split from run_closed so the spawn/config plumbing
-/// stays readable.
-fn fly_closed(
-    args: &Args,
-    link: MspLink,
-    duration: f64,
-    out_dir: &Path,
-    sitl_info: SitlInfo,
-    terrain: Option<&TerrainGrid>,
-) -> Result<RunOutcome, String> {
-    let sim_link = SimLink::new().map_err(|e| format!("udp bind: {e}"))?;
-
-    let mut record =
-        RecordWriter::create(&out_dir.join("flight.jsonl")).map_err(|e| format!("record: {e}"))?;
-    record
-        .write_header(&RecordHeader {
-            mode: "closed",
-            seed: args.seed,
-            duration_s: duration,
-            preset: Preset::FREESTYLE_5IN.name,
-            profile: sitl_info.profile.clone(),
-            sitl: Some(SitlProvenance {
-                path: sitl_info.bin.clone(),
-                sha256: sitl_info.sha256.clone(),
-                version: sitl_info.version.clone(),
-            }),
-            sensors: args.sensor_cfg.clone(),
-            wind: args.wind_cfg,
-        })
-        .map_err(|e| format!("record header: {e}"))?;
-
-    let started = Instant::now();
-    let stop = Arc::new(AtomicBool::new(false));
-    let (telem, telem_handle) = spawn_telemetry(link, started, Arc::clone(&stop));
-
-    let run_res = fly_loop(args, record, duration, &sim_link, &telem, terrain);
-    stop.store(true, Ordering::Relaxed);
-    if telem_handle.join().is_err() {
-        eprintln!("[sim_run] telemetry thread panicked");
-    }
-    let telem_state = telem.lock().unwrap();
-    let (status_samples, msp_errors) = (telem_state.status.clone(), telem_state.errors);
-    drop(telem_state);
-    run_res.map(|lo| {
-        let wall_s = started.elapsed().as_secs_f64();
-        let mut loop_ms = lo.loop_ms;
-        loop_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        RunOutcome {
-            record_hash: lo.record_hash,
-            ticks: (duration / TICK_DT).floor() as usize,
-            wall_s,
-            final_alt: lo.final_alt,
-            max_alt: lo.max_alt,
-            final_soc: lo.final_soc,
-            final_vbus: lo.final_vbus,
-            final_i_bus: lo.final_i_bus,
-            rpm_end: lo.rpm_end,
-            att_samples: lo.att_samples,
-            armed_at_s: lo.armed_at,
-            status_samples,
-            loop_p50_ms: pct(&loop_ms, 0.50),
-            loop_p99_ms: pct(&loop_ms, 0.99),
-            loop_max_ms: *loop_ms.last().unwrap_or(&0.0),
-            servo_packets: lo.servo_packets,
-            msp_errors,
-            sensors: args.sensors,
-            wind: args.wind_cfg.is_some(),
-            sitl: Some(sitl_info),
-            terrain: None,
-            track: None,
-        }
+    let mut flyer = Flyer::start(&cfg, &out_dir, "flight.jsonl")?;
+    flyer.pump((duration / TICK_DT).floor() as usize)?;
+    let st = flyer.finish()?;
+    Ok(RunOutcome {
+        record_hash: st.record_hash,
+        ticks: st.ticks,
+        wall_s: st.wall_s,
+        final_alt: st.final_alt,
+        max_alt: st.max_alt,
+        final_soc: st.final_soc,
+        final_vbus: st.final_vbus,
+        final_i_bus: st.final_i_bus,
+        rpm_end: st.rpm_end,
+        att_samples: st.att_samples,
+        armed_at_s: st.armed_at_s,
+        status_samples: st.status_samples,
+        loop_p50_ms: st.loop_p50_ms,
+        loop_p99_ms: st.loop_p99_ms,
+        loop_max_ms: st.loop_max_ms,
+        servo_packets: st.servo_packets,
+        msp_errors: st.msp_errors,
+        sensors: st.sensors,
+        wind: st.wind,
+        sitl: Some(SitlInfo {
+            bin: st.sitl.bin,
+            sha256: st.sitl.sha256,
+            version: st.sitl.version,
+            profile: st.sitl.profile,
+            profile_readback_ok: st.sitl.profile_readback_ok,
+        }),
+        terrain: None,
+        track: None,
     })
-}
-
-/// What the flight loop itself measured and produced.
-struct LoopOutcome {
-    record_hash: u64,
-    att_samples: usize,
-    armed_at: Option<f64>,
-    max_alt: f64,
-    final_alt: f64,
-    final_soc: f64,
-    final_vbus: f64,
-    final_i_bus: f64,
-    rpm_end: [f64; 4],
-    servo_packets: u64,
-    loop_ms: Vec<f64>,
-}
-
-/// The flight loop proper: RC arming state machine, 8 kHz substeps over UDP,
-/// servo feedback, record writing, wall pacing. With terrain the closed-mode
-/// spawn sits half a metre above the DEM height at the origin; ground
-/// contact follows the grid from the first substep.
-fn fly_loop(
-    args: &Args,
-    mut record: RecordWriter,
-    duration: f64,
-    sim_link: &SimLink,
-    telem: &Arc<Mutex<TelemState>>,
-    terrain: Option<&TerrainGrid>,
-) -> Result<LoopOutcome, String> {
-    // --gps-stale feeds an out-of-range lat/lon the SITL treats as the GPS
-    // sentinel (sitl.c: skip the update so the virtual GPS goes stale).
-    let (origin_lat, origin_lon) = if args.gps_stale { (999.0, 999.0) } else { (47.6, -122.3) };
-    let total_ticks = (duration / TICK_DT).floor() as usize;
-    let mut loop_ms = Vec::with_capacity(total_ticks);
-    let mut max_alt = 0.0f64;
-    let mut att_samples = 0usize;
-    let mut last_seq = 0u64;
-    let mut servo_packets = 0u64;
-    let mut phase = ArmPhase::WaitGrace;
-    let mut phase_entered = 0.0f64;
-    let mut armed_at: Option<f64> = None;
-    let spawn_z = 0.5 + terrain.map_or(0.0, |g| g.h_at(0.0, 0.0));
-    let mut quad = Quad::new(Preset::FREESTYLE_5IN, DVec3::new(0.0, 0.0, spawn_z));
-    if let Some(grid) = terrain {
-        quad.ground = Ground::Grid(grid.clone());
-    }
-    // Sensor model seeded from the run seed; None keeps the fdm path
-    // bit-identical to the pre-sensor harness.
-    let mut sensor = args.sensor_cfg.as_ref().map(|c| SensorModel::new(*c));
-    // Wind advances once per tick; None keeps the physics path bit-identical
-    // to the pre-wind harness (Quad::wind stays zero).
-    let mut wind = args.wind_cfg.map(WindModel::new);
-    if let Some(cfg) = &wind {
-        quad.wind = cfg.config().mean;
-    }
-
-    for tick in 0..total_ticks {
-        let tick_start = Instant::now();
-        let t = (tick + 1) as f64 * TICK_DT;
-        if let Some(w) = wind.as_mut() {
-            quad.wind = w.step(TICK_DT, quad.state.pos.z);
-        }
-
-        // Latest FC status drives the arming state machine.
-        let (arm, flags) = {
-            let st = telem.lock().unwrap();
-            st.status.last().map(|s| (s.1, s.2)).unwrap_or((u32::MAX, 0))
-        };
-        let (thr, aux3, yaw, pitch, roll, next_phase) = match phase {
-            ArmPhase::WaitGrace => {
-                if t - phase_entered > GRACE_TIMEOUT_S {
-                    return Err(format!(
-                        "arming grace never cleared: arming_disable={arm:#x} at t={t:.1}"
-                    ));
-                }
-                if arm == 0 {
-                    (0.0, DISARMED_US, 0.0, 0.0, 0.0, Some(ArmPhase::WaitArmed))
-                } else {
-                    (0.0, DISARMED_US, 0.0, 0.0, 0.0, None)
-                }
-            }
-            ArmPhase::WaitArmed => {
-                if t - phase_entered > ARM_TIMEOUT_S {
-                    return Err(format!(
-                        "did not arm: arming_disable={arm:#x} flight_flags={flags:#x} at t={t:.1}"
-                    ));
-                }
-                if arm == 0 && flags & 1 != 0 {
-                    (0.0, ARMED_US, 0.0, 0.0, 0.0, Some(ArmPhase::Fly))
-                } else {
-                    (0.0, ARMED_US, 0.0, 0.0, 0.0, None)
-                }
-            }
-            ArmPhase::Fly => {
-                let dt = t - armed_at.unwrap_or(0.0);
-                let thr = if dt < SETTLE_S {
-                    0.0
-                } else if dt < SETTLE_S + RAMP_S {
-                    args.throttle * (dt - SETTLE_S) / RAMP_S
-                } else {
-                    args.throttle
-                };
-                let yaw = if t < args.yaw_until { args.yaw } else { 0.0 };
-                let pitch = if t < args.pitch_until { args.pitch } else { 0.0 };
-                let roll = if t < args.roll_until { args.roll } else { 0.0 };
-                (thr, ARMED_US, yaw, pitch, roll, None)
-            }
-        };
-        if let Some(next) = next_phase {
-            if next == ArmPhase::Fly {
-                armed_at = Some(t);
-                println!("[sim_run] armed at t={t:.2} s");
-            }
-            phase = next;
-            phase_entered = t;
-        }
-        sim_link
-            .send_rc(&rc_packet(roll, pitch, yaw, thr, aux3))
-            .map_err(|e| format!("send rc: {e}"))?;
-
-        for _ in 0..SUBSTEPS_PER_TICK {
-            quad.step(SUBSTEP_DT);
-            let pkt = match sensor.as_mut() {
-                Some(s) => {
-                    let (g, a) = quad.imu();
-                    let rpm_mean = quad.rpm.iter().sum::<f64>() / 4.0;
-                    let thr_mean = quad.throttle.iter().sum::<f64>() / 4.0;
-                    let (gn, an) = s.step(SUBSTEP_DT, g, a, rpm_mean, thr_mean);
-                    fdm_from_state_imu(&quad, gn, an, origin_lat, origin_lon, t)
-                }
-                None => fdm_from_state(&quad, origin_lat, origin_lon, t),
-            };
-            sim_link.send_fdm(&pkt).map_err(|e| format!("send fdm: {e}"))?;
-        }
-        let (motors, n) = sim_link.try_recv_motors();
-        servo_packets += n;
-        if let Some(m) = motors {
-            for i in 0..4 {
-                quad.throttle[i] = (m.motor_speed[i] as f64).clamp(0.0, 1.0);
-            }
-        }
-
-        // Record the newest telemetry snapshot once per tick (the thread
-        // produces ~25 Hz; the record keeps every new snapshot).
-        let fc = {
-            let st = telem.lock().unwrap();
-            if st.seq != last_seq {
-                last_seq = st.seq;
-                att_samples += 1;
-                st.latest.clone()
-            } else {
-                None
-            }
-        };
-
-        write_sample(&mut record, t, &quad, wind.is_some().then_some(quad.wind), fc)
-            .map_err(|e| format!("record: {e}"))?;
-        max_alt = max_alt.max(quad.state.pos.z);
-
-        // Wall-clock pacing: sleep off what is left of this 4 ms tick.
-        let elapsed = tick_start.elapsed();
-        let budget = Duration::from_secs_f64(TICK_DT);
-        if elapsed < budget {
-            std::thread::sleep(budget - elapsed);
-        }
-        loop_ms.push(elapsed.as_secs_f64() * 1e3);
-    }
-    let record_hash = record.finish().map_err(|e| format!("record finish: {e}"))?;
-    Ok(LoopOutcome {
-        record_hash,
-        att_samples,
-        armed_at,
-        max_alt,
-        final_alt: quad.state.pos.z,
-        final_soc: quad.soc(),
-        final_vbus: quad.bus_voltage(),
-        final_i_bus: quad.bus_current(),
-        rpm_end: quad.rpm,
-        servo_packets,
-        loop_ms,
-    })
-}
-
-/// Owns the SITL child process; kills it on drop so a failed run cannot
-/// leave an orphan holding the ports.
-struct SitlProc {
-    child: Option<Child>,
-}
-
-impl Drop for SitlProc {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-/// Poll-connect to the SITL's MSP serial bridge until it accepts (up to 15 s),
-/// then confirm STATUS answers. A child that exits early is reported, not
-/// waited on blindly.
-fn wait_msp_ready(guard: &mut SitlProc) -> Result<MspLink, String> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Ok(l) = MspLink::connect(MSP_ADDR) {
-            let mut l = l;
-            match l.request_v1(MSP_STATUS) {
-                Ok(payload) => {
-                    if decode_status(&payload).is_none() {
-                        return Err("STATUS answered but the payload does not decode".into());
-                    }
-                    return Ok(l);
-                }
-                Err(_) => {
-                    // Port open before the firmware serves MSP: drop and retry.
-                    drop(l);
-                }
-            }
-        }
-        if let Some(c) = guard.child.as_mut() {
-            if let Ok(Some(status)) = c.try_wait() {
-                return Err(format!("SITL exited early: {status}"));
-            }
-        }
-        if Instant::now() > deadline {
-            return Err("timed out waiting for the SITL MSP port".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// summary.json: run facts, provenance, and the quantitative acceptance

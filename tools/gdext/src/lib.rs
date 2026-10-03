@@ -7,11 +7,21 @@
 //! The acceptance contract is tests/godot_live.rs: a flight driven through
 //! this class is byte-identical to the same flight through sim_run.
 //!
+//! M2b adds `DarterFlyer`: the whole closed-mode runner (darter_core::flyer,
+//! lifted verbatim from sim_run's closed mode) as a class — `flyer_start`
+//! spawns the Betaflight SITL child and applies the profile over MSP CLI,
+//! `flyer_pump` drives 250 Hz ticks in chunks (each wall-paced inside),
+//! `flyer_state_dict` samples the flight for a render loop, `flyer_finish`
+//! closes the record. Its contract with sim_run is shared behavior, not byte
+//! parity: the SITL's own PID runs on wall-clock time, so identical inputs
+//! vary run to run (tests/godot_flyer.rs is the acceptance suite).
+//!
 //! Panics never cross the FFI boundary: every fallible call reports via
 //! godot_error! plus a boolean / empty-string / empty-state return, and the
 //! probe scene treats those as a failure.
 
 use darter_core::flight::{CoreFlight, CoreSetup, TICK_DT};
+use darter_core::flyer::{Flyer, FlyerConfig};
 use darter_core::preset::Preset;
 use darter_core::terrain::TerrainGrid;
 use darter_core::DVec3;
@@ -220,6 +230,171 @@ impl DarterQuad {
     #[func]
     fn tick_dt(&self) -> f64 {
         TICK_DT
+    }
+}
+
+/// The closed-flyer runner (darter_core::flyer) as a Godot class: one flight
+/// from SITL spawn to closed record, driven per-call the same way sim_run
+/// --mode closed runs it. `flyer_start` → pump chunks → `flyer_state_dict`
+/// between them → `flyer_finish`. Only one flight lives on an instance; a
+/// finished one is cleared, so `flyer_start` again is legal.
+#[derive(GodotClass)]
+#[class(base = RefCounted)]
+struct DarterFlyer {
+    /// The flight in progress; `flyer_finish` consumes and clears it. Every
+    /// method guards on None instead of unwrapping across the FFI boundary.
+    flyer: Option<Flyer>,
+}
+
+#[godot_api]
+impl IRefCounted for DarterFlyer {
+    fn init(_base: Base<RefCounted>) -> Self {
+        Self { flyer: None }
+    }
+}
+
+#[godot_api]
+impl DarterFlyer {
+    /// Spawn the SITL child, apply + diff-verify the profile, open the
+    /// record, arm. Returns the empty string on success, else the failure
+    /// text — errors cannot panic across the FFI boundary. `profile` "" =
+    /// the runner default; a nonpositive `*_until` = stick held for the
+    /// whole flight (GDScript cannot express infinity). Record is written as
+    /// `flight.jsonl` under `work_dir`, which is also the SITL's fresh cwd.
+    #[func]
+    fn flyer_start(
+        &mut self,
+        sitl_bin: GString,
+        work_dir: GString,
+        duration_s: f64,
+        seed: i64,
+        throttle: f64,
+        yaw: f64,
+        yaw_until: f64,
+        profile: GString,
+    ) -> String {
+        if self.flyer.is_some() {
+            let m = "flyer_start while a flight is already running".to_string();
+            godot_error!("DarterFlyer: {m}");
+            return m;
+        }
+        let seed = match u64::try_from(seed) {
+            Ok(s) => s,
+            Err(_) => {
+                let m = format!("seed must be non-negative (got {seed})");
+                godot_error!("DarterFlyer: {m}");
+                return m;
+            }
+        };
+        let work = work_dir.to_string();
+        if work.is_empty() {
+            let m = "flyer_start: empty work dir".to_string();
+            godot_error!("DarterFlyer: {m}");
+            return m;
+        }
+        let profile = profile.to_string();
+        let mut cfg = FlyerConfig::new(sitl_bin.to_string(), seed, duration_s);
+        cfg.throttle = throttle;
+        cfg.yaw = yaw;
+        cfg.yaw_until = if yaw_until > 0.0 { yaw_until } else { f64::INFINITY };
+        cfg.profile = if profile.is_empty() { None } else { Some(profile) };
+        match Flyer::start(&cfg, std::path::Path::new(&work), "flight.jsonl") {
+            Ok(f) => {
+                self.flyer = Some(f);
+                String::new()
+            }
+            Err(e) => {
+                godot_error!("DarterFlyer: flyer_start: {e}");
+                e
+            }
+        }
+    }
+
+    /// Advance at most `n` more 250 Hz ticks (no-op past the plan). Returns
+    /// the empty string on success, else the failure text.
+    #[func]
+    fn flyer_pump(&mut self, n: i64) -> String {
+        if n < 0 {
+            let m = format!("flyer_pump got negative {n}");
+            godot_error!("DarterFlyer: {m}");
+            return m;
+        }
+        let Some(f) = self.flyer.as_mut() else {
+            let m = "flyer_pump before flyer_start".to_string();
+            godot_error!("DarterFlyer: {m}");
+            return m;
+        };
+        match f.pump(n.unsigned_abs() as usize) {
+            Ok(()) => String::new(),
+            Err(e) => {
+                godot_error!("DarterFlyer: flyer_pump: {e}");
+                e
+            }
+        }
+    }
+
+    /// Live view of the flight for the render loop: position and velocity in
+    /// metres, orientation quaternion, state of charge and bus voltage
+    /// (`soc` -1.0 means no flight is open), sim time the ARM box went up
+    /// (null before arming), progress counters, max altitude so far.
+    #[func]
+    fn flyer_state_dict(&mut self) -> Dictionary<GString, Variant> {
+        let mut d = Dictionary::new();
+        match self.flyer.as_ref() {
+            None => {
+                d.set("soc", -1.0);
+                d.set("vbus", -1.0);
+                d.set("armed_at", &Variant::nil());
+                d.set("ticks_done", 0);
+                d.set("ticks_total", 0);
+                d.set("max_alt", 0.0);
+            }
+            Some(f) => {
+                let s = f.snapshot();
+                d.set("pos", Vector3::new(s.pos.x as f32, s.pos.y as f32, s.pos.z as f32));
+                d.set("vel", Vector3::new(s.vel.x as f32, s.vel.y as f32, s.vel.z as f32));
+                d.set(
+                    "quat",
+                    Quaternion::new(
+                        s.quat.x as f32,
+                        s.quat.y as f32,
+                        s.quat.z as f32,
+                        s.quat.w as f32,
+                    ),
+                );
+                d.set("soc", s.soc as f32);
+                d.set("vbus", s.vbus as f32);
+                match s.armed_at {
+                    Some(t) => d.set("armed_at", t),
+                    None => d.set("armed_at", &Variant::nil()),
+                }
+                d.set("ticks_done", s.ticks_done as i64);
+                d.set("ticks_total", s.ticks_total as i64);
+                d.set("max_alt", s.max_alt);
+            }
+        }
+        d
+    }
+
+    /// Stop the telemetry thread, close the record and return its 16-hex
+    /// fnv1a64 hash — the same value sim_run prints for a closed run. Empty
+    /// string on failure (a godot error was logged). The flight is consumed;
+    /// the SITL child is killed here so the fixed MSP port frees.
+    #[func]
+    fn flyer_finish(&mut self) -> String {
+        let Some(f) = self.flyer.as_mut() else {
+            godot_error!("DarterFlyer: flyer_finish with no flight running");
+            return String::new();
+        };
+        let result = f.finish();
+        self.flyer = None; // record closed; drop kills the child, frees the port
+        match result {
+            Ok(st) => format!("{:016x}", st.record_hash),
+            Err(e) => {
+                godot_error!("DarterFlyer: record finish: {e}");
+                String::new()
+            }
+        }
     }
 }
 

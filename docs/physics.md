@@ -395,8 +395,12 @@ and comparing FNV hashes.
 
 ## 11. The closed loop against real firmware
 
-`src/bin/sim_run/main.rs` in closed mode spawns the real Betaflight SITL
-binary as a child process and flies it over two links:
+The closed-mode runner lives in `src/flyer.rs` (darter_core::flyer), lifted
+verbatim from `src/bin/sim_run/main.rs` in M2b so two call paths drive the
+identical code: `sim_run --mode closed` is a thin CLI wrapper, and the
+gdext `DarterFlyer` class (tools/gdext) drives it per-call from GDScript
+(verified against sim_run's behavior in tests/godot_flyer.rs). Both fly the
+real Betaflight SITL binary as a child process over two links:
 
 - **Servo/FDM over UDP**: the sim sends FdmPacket (144 B little-endian, 18
   f64: timestamp, gyro, accel, quaternion, velocity, lon/lat/alt, pressure)

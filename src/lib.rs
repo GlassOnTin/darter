@@ -8,6 +8,7 @@
 pub mod air;
 pub mod battery;
 pub mod flight;
+pub mod flyer;
 pub mod msp;
 pub mod rng;
 pub mod preset;

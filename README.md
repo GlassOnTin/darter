@@ -116,15 +116,27 @@ cargo test --test godot_live -- --ignored   # M2a: live plant vs sim_run parity
 
 All three run in CI after the Godot and GDExtension build steps.
 
+The fourth suite also needs the extension, plus the Betaflight SITL binary
+the closed runner spawns on fixed ports (recipe in `tests/sitl_loop.rs`, so
+not in CI). It drives the same closed loop `sim_run --mode closed` runs —
+SITL child + profile over MSP CLI + arming state machine — from GDScript
+through the DarterFlyer class (M2b); the contract is behaviour, not byte
+parity, because the firmware's PID loop runs on wall-clock time
+(`docs/physics.md` section 11):
+
+```
+cargo test --test godot_flyer -- --ignored --test-threads=1
+```
+
 ## Repo layout
 
 | path | contents |
 | --- | --- |
-| `src/` | the `darter-core` crate; `src/bin/sim_run` is the flight recorder CLI |
+| `src/` | the `darter-core` crate; `src/bin/sim_run` is the flight recorder CLI (closed mode = thin wrapper over `src/flyer.rs`, the closed runner) |
 | `docs/physics.md` | the applied-maths write-up: model equations, calibration status, known errors |
 | `tools/area_pack.py` | OSM/DEM area importer and pack validator |
 | `tools/godot_smoke/` | Godot 4 test project, demo bundle script, Android export preset |
-| `tools/gdext/` | the standalone gdext crate: `DarterQuad`, the live plant (Godot bindings, never built by `cargo test`) |
+| `tools/gdext/` | the standalone gdext crate: `DarterQuad` (live plant) and `DarterFlyer` (closed runner), Godot bindings never built by `cargo test` |
 | `tests/` | the cargo suites, including the Godot render gates |
 
 ## Data attribution
