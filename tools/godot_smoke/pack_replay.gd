@@ -118,6 +118,31 @@ var done := false
 # every 4th frame. DARTER_SAMPLE_EVERY overrides both (resolved in _ready).
 var sample_every := 1
 
+# Track (M1 rung): an optional darter_track JSON rendering gate rings + HUD,
+# mirrored against src/bin/sim_run/track.rs's crossing math. All positions
+# and normals are held as separate f64 scalars — Vector3 is f32 and the T7
+# test gates the mirror against Rust to |dt| <= 0.01 s. Empty until
+# _load_track() accepts a file; every use is guarded by track_on.
+var track_on := false
+var track_name := ""
+var track_cps_n := 0
+var track_is_loop := false
+var track_x: PackedFloat64Array = PackedFloat64Array()
+var track_y: PackedFloat64Array = PackedFloat64Array()
+var track_z: PackedFloat64Array = PackedFloat64Array()
+var track_nx: PackedFloat64Array = PackedFloat64Array()
+var track_ny: PackedFloat64Array = PackedFloat64Array()
+var track_nz: PackedFloat64Array = PackedFloat64Array()
+var track_r2: PackedFloat64Array = PackedFloat64Array()
+var track_kinds: Array = []  # "gate" | "start", per checkpoint
+var track_events: Array = []  # [cp_index, t_cross] pairs, file order until sorted at done
+var track_lap := 0            # live start-gate crossing count (HUD only)
+var track_last_idx := -1      # last walked record row (mirror walk source)
+var track_next_gate := -1     # currently pulsed gate node, -1 = none
+var gate_nodes: Array = []
+var gate_mats: Array = []
+var track_hud: Label
+
 # Lighting preset (S1 art pass). Selected by env DARTER_LIGHTING; the tests
 # never set it, so the default pins the canon run.
 const LIGHTING_PRESETS := preload("lighting_presets.gd")
@@ -134,6 +159,7 @@ func _ready() -> void:
 	if env_se != "":
 		sample_every = maxi(1, int(env_se))
 	_load_pack_and_build_scene()
+	_load_track()
 	# Bundled record fallback, same reason as the pack (see above).
 	var path := OS.get_environment("DARTER_RECORD")
 	if path == "":
@@ -494,6 +520,243 @@ func _build_world() -> void:
 	LIGHTING_PRESETS.apply(preset, env, sky_mat, sun)
 
 
+# Track precedence: DARTER_TRACK env when set; else the APK-bundled demo
+# (res://track/demo_track.json) only on Android — the device plays the demo
+# with no env plumbing; else disabled (desktop with no env keeps today's
+# base path and byte-identical replay). A missing env-pointed file is a hard
+# quit; a missing Android fallback is a soft skip (print, no track features).
+# Validation mirrors parse() in src/bin/sim_run/track.rs — the renderer must
+# accept exactly what the Rust CLI accepts, with hard errors too.
+func _load_track() -> void:
+	var env_path := OS.get_environment("DARTER_TRACK")
+	var path := env_path
+	if path == "":
+		if not OS.has_feature("android"):
+			return
+		path = "res://track/demo_track.json"
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		if env_path == "" and OS.has_feature("android"):
+			print("TRACK_SKIPPED missing %s" % path)
+			return
+		push_error("cannot open track %s" % path)
+		get_tree().quit(1)
+		return
+	var j = JSON.parse_string(f.get_as_text())
+	if typeof(j) != TYPE_DICTIONARY:
+		push_error("track %s: not a JSON object" % path)
+		get_tree().quit(1)
+		return
+	_track_validate(j)
+	_build_gates()
+	_build_hud()
+	# Next expected gate pulses from the start (index 0).
+	gate_mats[0].emission_energy_multiplier = 3.0
+	track_next_gate = 0
+	track_on = true
+	print("TRACK_LOADED name=%s cps=%d loop=%s" % [track_name, track_cps_n, track_is_loop])
+
+
+func _track_fail(msg: String) -> void:
+	push_error("track: %s" % msg)
+	get_tree().quit(1)
+
+
+func _track_is_num(v) -> bool:
+	return typeof(v) == TYPE_FLOAT and is_finite(v)
+
+
+func _track_exact_keys(d: Dictionary, want: Array, what: String) -> void:
+	for key in d:
+		if not (key in want):
+			_track_fail("%s has unknown key \"%s\" (allowed: %s)" % [what, key, ", ".join(want)])
+
+
+func _track_validate(j: Dictionary) -> void:
+	var top := ["schema", "version", "name", "spawn", "checkpoints"]
+	_track_exact_keys(j, top, "track")
+	if j.get("schema") != "darter_track":
+		_track_fail('schema must be "darter_track"')
+	if j.get("version") != 1.0:
+		_track_fail("version must be 1")
+	var name_v = j.get("name")
+	if typeof(name_v) != TYPE_STRING or name_v == "":
+		_track_fail("name must be a non-empty string")
+	track_name = name_v
+	if j.has("spawn"):
+		var sp = j.get("spawn")
+		if typeof(sp) != TYPE_DICTIONARY:
+			_track_fail("spawn must be an object")
+		_track_exact_keys(sp, ["x", "y", "z"], "spawn")
+		for axis in ["x", "y", "z"]:
+			if not _track_is_num(sp.get(axis)):
+				_track_fail("spawn %s must be a finite number" % axis)
+		# Advisory metadata only (mirrors the CLI): never read for anything.
+	var cps = j.get("checkpoints")
+	if typeof(cps) != TYPE_ARRAY or cps.size() < 2:
+		_track_fail("checkpoints must be an array of at least 2")
+	track_cps_n = cps.size()
+	track_x.resize(track_cps_n)
+	track_y.resize(track_cps_n)
+	track_z.resize(track_cps_n)
+	track_r2.resize(track_cps_n)
+	track_kinds.resize(track_cps_n)
+	var n_start := 0
+	var first_start := -1
+	for i in range(track_cps_n):
+		var cp = cps[i]
+		if typeof(cp) != TYPE_DICTIONARY:
+			_track_fail("checkpoint %d must be an object" % i)
+		_track_exact_keys(cp, ["kind", "x", "y", "z", "radius_m"], "checkpoint %d" % i)
+		var kind = cp.get("kind")
+		if kind != "gate" and kind != "start":
+			_track_fail('checkpoint %d: kind must be "gate" or "start"' % i)
+		if kind == "start":
+			n_start += 1
+			if first_start < 0:
+				first_start = i
+		for kv in [["x", 0], ["y", 1], ["z", 2]]:
+			if not _track_is_num(cp.get(kv[0])):
+				_track_fail("checkpoint %d: %s must be a finite number" % [i, kv[0]])
+		var r = cp.get("radius_m")
+		if not _track_is_num(r) or float(r) <= 0.0 or float(r) > 1000.0:
+			_track_fail("checkpoint %d: radius_m must be in (0, 1000]" % i)
+		track_x[i] = float(cp["x"])
+		track_y[i] = float(cp["y"])
+		track_z[i] = float(cp["z"])
+		track_r2[i] = float(r) * float(r)
+		track_kinds[i] = kind
+	if n_start > 1:
+		_track_fail("at most one start checkpoint")
+	if n_start == 1 and first_start != 0:
+		_track_fail("the start checkpoint must be the first entry")
+	track_is_loop = n_start == 1
+	if track_is_loop and track_cps_n < 3:
+		_track_fail("a loop needs at least 3 checkpoints")
+	# Distinctness: adjacent checkpoints (plus last-vs-first on a loop) may
+	# not coincide, and every neighbour span may not be degenerate — same
+	# rules and thresholds as the Rust parse.
+	var n := track_cps_n
+	for i in range(n):
+		var nxt: int = (i + 1) % n if track_is_loop else mini(i + 1, n - 1)
+		var prv: int = (i + n - 1) % n if track_is_loop else maxi(i - 1, 0)
+		var dx := track_x[nxt] - track_x[prv]
+		var dy := track_y[nxt] - track_y[prv]
+		var dz := track_z[nxt] - track_z[prv]
+		var span := sqrt(dx * dx + dy * dy + dz * dz)
+		if span < 1e-6:
+			_track_fail("checkpoint %d has a degenerate normal (neighbours coincide)" % i)
+		# Adjacent positions distinct (loop adds the last-vs-first pair).
+		var others: Array = [i + 1] if i < n - 1 else []
+		if track_is_loop and i == n - 1:
+			others.append(0)
+		var dmin := INF
+		var bad_j := -1
+		for j2 in others:
+			var ax := track_x[j2] - track_x[i]
+			var ay := track_y[j2] - track_y[i]
+			var az := track_z[j2] - track_z[i]
+			var dist := sqrt(ax * ax + ay * ay + az * az)
+			if dist < dmin:
+				dmin = dist
+				bad_j = j2
+		if dmin < 1e-3:
+			_track_fail("checkpoints %d and %d coincide" % [i, bad_j])
+	# Unit plane normals, same neighbour rule as normals() in track.rs.
+	track_nx.resize(track_cps_n)
+	track_ny.resize(track_cps_n)
+	track_nz.resize(track_cps_n)
+	for i in range(track_cps_n):
+		var nxt: int = (i + 1) % n if track_is_loop else mini(i + 1, n - 1)
+		var prv: int = (i + n - 1) % n if track_is_loop else maxi(i - 1, 0)
+		var dx := track_x[nxt] - track_x[prv]
+		var dy := track_y[nxt] - track_y[prv]
+		var dz := track_z[nxt] - track_z[prv]
+		var l := sqrt(dx * dx + dy * dy + dz * dz)
+		track_nx[i] = dx / l
+		track_ny[i] = dy / l
+		track_nz[i] = dz / l
+
+
+# Gate rings as children of the world root: TorusMesh hole axis along the
+# checkpoint normal (ENU -> Godot: (x, z, -y)); centreline radius is the
+# checkpoint radius, ring thickness 0.30 m. Start ring orange, gates cyan;
+# the next expected gate pulses brighter. Demo normals are near-horizontal,
+# so the near-vertical fallback basis is a rarely-hit guard (eyeballed only).
+func _build_gates() -> void:
+	for i in range(track_cps_n):
+		var r := float(sqrt(track_r2[i]))
+		var torus := TorusMesh.new()
+		torus.inner_radius = maxf(r - 0.15, 0.01)
+		torus.outer_radius = r + 0.15
+		var start_kind: bool = track_kinds[i] == "start"
+		var col := Color(1.0, 0.55, 0.1) if start_kind else Color(0.1, 0.85, 1.0)
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = col
+		mat.emission_enabled = true
+		mat.emission = col
+		mat.emission_energy_multiplier = 1.0
+		var mi := MeshInstance3D.new()
+		mi.mesh = torus
+		mi.material_override = mat
+		# ENU (x, y, z) -> Godot (X, Y, Z) = (x, z, -y), same rule as the mesh
+		# verts and the quad.
+		mi.position = Vector3(track_x[i], track_z[i], -track_y[i])
+		var dir := Vector3(track_nx[i], track_nz[i], -track_ny[i])
+		# Near-vertical normal fallback (the hole axis cannot use UP): stand
+		# the ring on its edge via X instead. Rare guard; eyeballed only.
+		if absf(dir.dot(Vector3.UP)) > 0.999:
+			mi.basis = Basis(Quaternion(Vector3.RIGHT, dir))
+		else:
+			mi.basis = Basis(Quaternion(Vector3.UP, dir))
+		add_child(mi)
+		gate_nodes.append(mi)
+		gate_mats.append(mat)
+
+
+func _build_hud() -> void:
+	var cl := CanvasLayer.new()
+	add_child(cl)
+	track_hud = Label.new()
+	cl.add_child(track_hud)
+	track_hud.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	track_hud.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
+	track_hud.offset_top = 12.0
+	track_hud.add_theme_font_size_override("font_size", 44)
+	# Sky at the HUD strip is near-white; black fill + white outline keeps
+	# the text readable in every frame.
+	track_hud.add_theme_color_override("font_color", Color.BLACK)
+	track_hud.add_theme_color_override("font_outline_color", Color.WHITE)
+	track_hud.add_theme_constant_override("outline_size", 8)
+	track_hud.text = "Gate 1/%d" % track_cps_n
+
+
+func _track_event_fired(i: int, t: float) -> void:
+	track_events.append([i, t])
+	if track_kinds[i] == "start":
+		track_lap += 1
+	var k := track_events.size()
+	if k <= track_cps_n:
+		if track_next_gate >= 0:
+			var old: StandardMaterial3D = gate_mats[track_next_gate]
+			old.emission_energy_multiplier = 1.0
+		track_next_gate = k if k < track_cps_n else -1
+		if track_next_gate >= 0:
+			var nxt: StandardMaterial3D = gate_mats[track_next_gate]
+			nxt.emission_energy_multiplier = 3.0
+	if track_hud != null:
+		if k >= track_cps_n:
+			track_hud.text = "Done  %.2f s" % t
+		else:
+			var lap_txt := ("Lap %d  " % track_lap) if (track_is_loop and track_lap > 0) else ""
+			track_hud.text = "%sGate %d/%d  %.2f s" % [lap_txt, k + 1, track_cps_n, t]
+
+
+func _track_esc(s: String) -> String:
+	# JSON string escaping: backslash first, then the quote.
+	return s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+
 func _process(_delta: float) -> void:
 	if done:
 		return
@@ -507,6 +770,31 @@ func _process(_delta: float) -> void:
 	var py: float = r["py"]
 	var pz: float = r["pz"]
 	quad.position = Vector3(px, pz, -py)
+	if track_on:
+		# Mirror of track.rs compute_events at display cadence: every record
+		# row pair is walked exactly once (track_last_idx guards double
+		# counting), scalar f64s throughout because Vector3 is f32 and the
+		# comparison must match the Rust CLI's f64 math.
+		for k in range(maxi(track_last_idx + 1, 1), idx + 1):
+			var ak: Dictionary = rows[k - 1]
+			var bk: Dictionary = rows[k]
+			var tax: float = float(ak["px"])
+			var tay: float = float(ak["py"])
+			var taz: float = float(ak["pz"])
+			var tbx: float = float(bk["px"])
+			var tby: float = float(bk["py"])
+			var tbz: float = float(bk["pz"])
+			for i in range(track_cps_n):
+				var d_a: float = (tax - track_x[i]) * track_nx[i] + (tay - track_y[i]) * track_ny[i] + (taz - track_z[i]) * track_nz[i]
+				var d_b: float = (tbx - track_x[i]) * track_nx[i] + (tby - track_y[i]) * track_ny[i] + (tbz - track_z[i]) * track_nz[i]
+				if d_b > 0.0 and d_a <= 0.0:
+					var sfrac: float = d_a / (d_a - d_b)
+					var hx: float = tax + (tbx - tax) * sfrac - track_x[i]
+					var hy: float = tay + (tby - tay) * sfrac - track_y[i]
+					var hz: float = taz + (tbz - taz) * sfrac - track_z[i]
+					if hx * hx + hy * hy + hz * hz <= track_r2[i]:
+						_track_event_fired(i, float(ak["t"]) + (float(bk["t"]) - float(ak["t"])) * sfrac)
+		track_last_idx = idx
 	# Chase cam 10 m behind along the recorded velocity, 4 m above, looking
 	# at the quad.
 	var prev: Dictionary = rows[maxi(idx - 1, 0)]
@@ -580,9 +868,35 @@ func _process(_delta: float) -> void:
 			get_tree().quit(1)
 			return
 		var samples := ",".join(PackedStringArray(entries))
+		# Track block written by the renderer's own recompute (decision 7).
+		# Empty string when track is off: the emit stays byte-identical to
+		# the pre-track format. Events sorted by (t, i) like the Rust CLI;
+		# lap splits are consecutive start-crossing times, [] until a start
+		# fires, null on an open track.
+		var track_json := ""
+		if track_on:
+			track_events.sort_custom(func(a, b):
+				return a[1] < b[1] or (a[1] == b[1] and a[0] < b[0]))
+			var ev_parts: PackedStringArray = []
+			for e in track_events:
+				ev_parts.append("[%d,%.3f]" % [e[0], e[1]])
+			var sp_str := "null"
+			if track_is_loop:
+				var start_ts: Array = []
+				for e in track_events:
+					if track_kinds[e[0]] == "start":
+						start_ts.append(e[1])
+				var sp_parts: PackedStringArray = []
+				for w in range(1, start_ts.size()):
+					sp_parts.append("%.3f" % (start_ts[w] - start_ts[w - 1]))
+				sp_str = "[%s]" % ",".join(sp_parts)
+			track_json = ",\"track\":{\"schema\":\"darter_track\",\"version\":1,\"name\":\"%s\",\"checkpoints\":%d,\"loop\":%s,\"events\":[%s],\"lap_splits\":%s}" % [
+				_track_esc(track_name), track_cps_n, "true" if track_is_loop else "false",
+				",".join(ev_parts), sp_str
+			]
 		g.store_string(
-			"{\"movie_fps\":%d,\"frames\":%d,%s,\"samples\":[%s]}" % [
-				int(MOVIE_FPS), total_frames, get_meta("pack_json", "\"pack\":{}"), samples
+			"{\"movie_fps\":%d,\"frames\":%d,%s%s,\"samples\":[%s]}" % [
+				int(MOVIE_FPS), total_frames, get_meta("pack_json", "\"pack\":{}"), track_json, samples
 			]
 		)
 		g.close()
