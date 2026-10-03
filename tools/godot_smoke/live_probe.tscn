@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://darter7live"]
+
+[ext_resource type="Script" path="res://live_probe.gd" id="1"]
+
+[node name="LiveProbe" type="Node"]
+script = ExtResource("1")

@@ -1,0 +1,16 @@
+; Darter live plant — GDExtension descriptor (committed; the .so payload is
+; gitignored and staged by tests/godot_live.rs / the CI build step from
+; tools/gdext, which holds the Rust source and the version pin).
+;
+; M2a rung: exposes the DarterQuad class (the darter-core flight loop) to
+; the Godot project. Only the desktop target is populated for parity
+; testing; android.arm64 lands with the on-device rungs (M2b+).
+
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = "4.7"
+
+[libraries]
+
+linux.x86_64 = "res://ext/libdarter_gd.so"

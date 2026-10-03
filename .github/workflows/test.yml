@@ -1,9 +1,15 @@
 # CI for the darter repo, two tiers:
 #   cargo:        the offline `cargo test` suite (no GPU, no network).
 #   godot-replay: the #[ignore]d renderer suites (tests/godot.rs,
-#                 tests/godot_pack.rs), which need the pinned Godot 4.7.2
-#                 binary and an X display. The tests spawn their own
-#                 xvfb-run wrappers, so the job only needs xvfb installed.
+#                 tests/godot_pack.rs, tests/godot_live.rs), which need the
+#                 pinned Godot 4.7.2 binary and an X display. The tests
+#                 spawn their own xvfb-run wrappers, so the job only needs
+#                 xvfb installed.
+#
+# tests/godot_live.rs additionally builds tools/gdext (the standalone
+# godot-rust GDExtension crate) and stages the .so before running; the
+# build step runs before the import pass so extension_list.cfg registers
+# the class in the fresh checkout too.
 #
 # The Godot binary is downloaded from the official 4.7.2-stable GitHub
 # release and verified against tools/godot/SHA512-SUMS.txt (the release's
@@ -43,7 +49,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # tools/gdext is a standalone crate (its own Cargo.lock/target, so the
+      # offline cargo tier never touches Godot bindings); cache it too or
+      # every CI run recompiles the bindings from scratch.
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tools/gdext
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -68,6 +81,12 @@ jobs:
         run: |
           cargo build --bin sim_run
           tools/godot_smoke/make_bundle.sh
+      # libdarter_gd.so is a gitignored payload staged into the project by
+      # tests/godot_live.rs; building it first means the import pass below
+      # registers the DarterQuad class and the replay suites exercise the
+      # same loaded extension.
+      - name: Build the darter-gd GDExtension
+        run: cargo build --release --manifest-path tools/gdext/Cargo.toml
       # Game-mode runs only consume the project's import cache (.godot/); a
       # fresh checkout has none, so run the editor's import pass once.
       # Verified 2026-10-03 from a wiped cache: exit 0 and the s3tc ctex
@@ -78,3 +97,5 @@ jobs:
         run: cargo test --test godot -- --ignored
       - name: T7 corridor + T8 demo-areas replay suites
         run: cargo test --test godot_pack -- --ignored
+      - name: M2a live-plant parity (GDExtension flight loop vs sim_run)
+        run: cargo test --test godot_live -- --ignored

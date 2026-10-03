@@ -36,6 +36,11 @@ stands today.
 - The physics core produces byte-identical flight records on x86_64 and
   aarch64, and the render suites pin per-area pixel statistics with dated
   floors so renderer changes are caught, not averaged away.
+- The core also runs inside Godot as a GDExtension class (`DarterQuad`,
+  from `tools/gdext`). Its flight loop is parity-tested byte-for-byte
+  against `sim_run` on flat and terrain-spawned flights — the live plant
+  the later milestones (on-screen/radio flying, on-device SITL) build on.
+  Not wired to any app screen yet.
 
 ## What is not built yet
 
@@ -85,9 +90,9 @@ the same build produced by CI and attached to the release.
 ## Tests
 
 `cargo test` runs the offline suites: physics golden records, MSP framing,
-track files, terrain, and pack regeneration and validation. Two renderer
-suites are `#[ignore]`d because they need the pinned Godot binary and an X
-display:
+track files, terrain, and pack regeneration and validation. Three renderer
+or renderer-adjacent suites are `#[ignore]`d because they need the pinned
+Godot binary and an X display:
 
 ```
 cargo test --test godot -- --ignored        # T5: record-to-movie replay smoke
@@ -99,6 +104,18 @@ dated floors; T8 does the same for the four demo areas, checks every bundle
 file byte-for-byte against a fresh offline regeneration, and exercises the
 picker and the no-environment error path. Both run in CI on every push.
 
+The third suite needs the extension built first (its parity flights drive
+the DarterQuad GDExtension class and compare records byte-for-byte against
+`sim_run --mode core` — flat and terrain-spawned, hash equality asserted
+both ways):
+
+```
+cargo build --release --manifest-path tools/gdext/Cargo.toml
+cargo test --test godot_live -- --ignored   # M2a: live plant vs sim_run parity
+```
+
+All three run in CI after the Godot and GDExtension build steps.
+
 ## Repo layout
 
 | path | contents |
@@ -107,6 +124,7 @@ picker and the no-environment error path. Both run in CI on every push.
 | `docs/physics.md` | the applied-maths write-up: model equations, calibration status, known errors |
 | `tools/area_pack.py` | OSM/DEM area importer and pack validator |
 | `tools/godot_smoke/` | Godot 4 test project, demo bundle script, Android export preset |
+| `tools/gdext/` | the standalone gdext crate: `DarterQuad`, the live plant (Godot bindings, never built by `cargo test`) |
 | `tests/` | the cargo suites, including the Godot render gates |
 
 ## Data attribution

@@ -11,4 +11,9 @@ __pycache__/
 /tools/godot_smoke/areas/*/
 /tools/godot_smoke/build/
 /tools/godot_smoke/.godot/
+# GDExtension payload: the committed ext/darter_gd.gdextension descriptor
+# points here, but the .so is built from tools/gdext (cargo) and staged
+# by tests/godot_live.rs / the CI build step — same tier as /target
+/tools/godot_smoke/ext/libdarter_gd.so
+/tools/gdext/target/
 /tools/elevation_cache/

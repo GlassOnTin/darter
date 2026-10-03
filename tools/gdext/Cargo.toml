@@ -1,0 +1,20 @@
+# The live-plant bridge: exposes darter-core's Quad to the Godot project as
+# a GDExtension class (see tests/godot_live.rs for the acceptance contract).
+# Standalone crate on purpose — own Cargo.lock, own target — so the main
+# package's offline test tier never fetches or compiles the Godot bindings.
+# Version pin: godot 0.5.5 api-4-7 matches the pinned Godot 4.7.2-stable
+# editor/exports in tools/godot.
+[package]
+name = "darter_gd"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Darter live plant: the darter-core physics as a Godot GDExtension class"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+darter-core = { path = "../.." }
+godot = { version = "0.5.5", features = ["api-4-7"] }

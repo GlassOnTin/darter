@@ -29,7 +29,7 @@
 //! to summary.json as p50/p99/max (VISION M0: frame-time instrumentation from
 //! the first commit).
 
-use std::io::{self, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -38,13 +38,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use darter_core::air::RHO_0;
+use darter_core::flight::{
+    pct, write_sample, CoreFlight, CoreSetup, SUBSTEPS_PER_TICK, SUBSTEP_DT, TICK_DT,
+};
 use darter_core::msp::{
     decode_attitude, decode_estimated_altitude, decode_motor, decode_raw_imu, decode_status,
     MspLink, MSP_ALTITUDE, MSP_ATTITUDE, MSP_MOTOR, MSP_RAW_IMU, MSP_STATUS,
 };
 use darter_core::preset::Preset;
 use darter_core::quad::{hover_throttle, Quad};
-use darter_core::record::{FcSample, RecordHeader, RecordWriter, Sample, SitlProvenance};
+use darter_core::record::{FcSample, RecordHeader, RecordWriter, SitlProvenance};
 use darter_core::sha256::sha256_hex;
 use darter_core::sensor::{SensorConfig, SensorModel};
 use darter_core::sitl::{fdm_from_state, fdm_from_state_imu, rc_packet, SimLink};
@@ -53,10 +56,6 @@ use darter_core::wind::{WindConfig, WindModel};
 use darter_core::DVec3;
 
 mod track;
-
-const SUBSTEP_DT: f64 = 125e-6; // 8 kHz core step
-const SUBSTEPS_PER_TICK: usize = 32; // 4 ms tick = 250 Hz fdm/RC
-const TICK_DT: f64 = SUBSTEP_DT * SUBSTEPS_PER_TICK as f64;
 
 const MSP_ADDR: &str = "127.0.0.1:5761";
 const SITL_MSP_PORT: u16 = 5761;
@@ -460,7 +459,8 @@ fn main() {
 /// `--throttle` when given — 0 = motors-off tests), no SITL, record every
 /// tick. Identical inputs produce identical record hashes. With terrain the
 /// spawn z is AGL over the DEM height (--alt stays an above-ground offset)
-/// and ground contact is the grid.
+/// and ground contact is the grid. The loop itself lives in
+/// darter_core::flight so the Godot extension flies the identical shape.
 fn run_core(
     args: &Args,
     record_name: &str,
@@ -475,91 +475,40 @@ fn run_core(
         .core_throttle
         .unwrap_or_else(|| hover_throttle(&preset, preset.battery, 1.0, RHO_0));
     println!("[sim_run] core mode: throttle {:.4}, {} s", thr, duration);
-    // AGL convention kept: --alt is an offset above the ground under (x, y).
-    // Flat h is a literal 0.0, so the no-terrain spawn is bit-identical.
-    let mut quad = Quad::new(
-        preset,
-        DVec3::new(args.x, args.y, args.alt + terrain.map_or(0.0, |g| g.h_at(args.x, args.y))),
-    );
-    if let Some(grid) = terrain {
-        quad.ground = Ground::Grid(grid.clone());
-    }
-    quad.throttle = [thr; 4];
-    // Scripted initial velocity (level transit; see the --vx doc comment).
-    if args.vx != 0.0 || args.vy != 0.0 || args.vz != 0.0 {
-        quad.state.vel = DVec3::new(args.vx, args.vy, args.vz);
-    }
-    let mut wind = args.wind_cfg.map(WindModel::new);
-    if let Some(cfg) = &wind {
-        quad.wind = cfg.config().mean;
-    }
-
-    let mut record = RecordWriter::create(&out_dir.join(record_name))
-        .map_err(|e| format!("record: {e}"))?;
-    record
-        .write_header(&RecordHeader {
-            mode: "core",
+    let mut flight = CoreFlight::new(
+        CoreSetup {
+            preset,
             seed: args.seed,
             duration_s: duration,
-            preset: preset.name,
-            profile: {
-                let mut p = vec![
-                    format!("throttle={thr:.6}"),
-                    format!("alt={:.3}", args.alt),
-                    format!("spawn=({:.3},{:.3})", args.x, args.y),
-                ];
-                if args.vx != 0.0 || args.vy != 0.0 || args.vz != 0.0 {
-                    p.push(format!("vel=({:.3},{:.3},{:.3})", args.vx, args.vy, args.vz));
-                }
-                p
-            },
-            sitl: None,
-            sensors: None,
-            wind: args.wind_cfg,
-        })
-        .map_err(|e| format!("record header: {e}"))?;
+            throttle: args.core_throttle,
+            alt_agl: args.alt,
+            x: args.x,
+            y: args.y,
+            vel: DVec3::new(args.vx, args.vy, args.vz),
+            wind_cfg: args.wind_cfg.clone(),
+            terrain: terrain.cloned(),
+        },
+        &out_dir.join(record_name),
+    )?;
+    flight.advance_ticks((duration / TICK_DT).floor() as usize)?;
+    let st = flight.finish()?;
 
-    let total_ticks = (duration / TICK_DT).floor() as usize;
-    let started = Instant::now();
-    let mut loop_ms = Vec::with_capacity(total_ticks);
-    let mut max_alt = 0.0f64;
-    for tick in 0..total_ticks {
-        let tick_start = Instant::now();
-        // Wind advances once per tick at the current altitude, then holds
-        // across the 32 substeps (the gust filter runs at tick rate).
-        if let Some(w) = wind.as_mut() {
-            quad.wind = w.step(TICK_DT, quad.state.pos.z);
-        }
-        for _ in 0..SUBSTEPS_PER_TICK {
-            quad.step(SUBSTEP_DT);
-        }
-        let t = (tick + 1) as f64 * TICK_DT;
-        // No sensor model yet (T3): the quad state is the telemetry, no FC.
-        write_sample(&mut record, t, &quad, wind.is_some().then_some(quad.wind), None)
-            .map_err(|e| format!("record: {e}"))?;
-        max_alt = max_alt.max(quad.state.pos.z);
-        loop_ms.push(tick_start.elapsed().as_secs_f64() * 1e3);
-    }
-    let wall_s = started.elapsed().as_secs_f64();
-    let record_hash = record.finish().map_err(|e| format!("record finish: {e}"))?;
-
-    loop_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Ok(RunOutcome {
-        record_hash,
-        ticks: total_ticks,
-        wall_s,
-        final_alt: quad.state.pos.z,
-        max_alt,
-        final_soc: quad.soc(),
-        final_vbus: quad.bus_voltage(),
-        final_i_bus: quad.bus_current(),
-        rpm_end: quad.rpm,
+        record_hash: st.record_hash,
+        ticks: st.ticks,
+        wall_s: st.wall_s,
+        final_alt: st.final_alt,
+        max_alt: st.max_alt,
+        final_soc: st.final_soc,
+        final_vbus: st.final_vbus,
+        final_i_bus: st.final_i_bus,
+        rpm_end: st.rpm_end,
         att_samples: 0,
         armed_at_s: None,
         status_samples: Vec::new(),
-        loop_p50_ms: pct(&loop_ms, 0.50),
-        loop_p99_ms: pct(&loop_ms, 0.99),
-        loop_max_ms: *loop_ms.last().unwrap_or(&0.0),
+        loop_p50_ms: st.loop_p50_ms,
+        loop_p99_ms: st.loop_p99_ms,
+        loop_max_ms: st.loop_max_ms,
         servo_packets: 0,
         msp_errors: 0,
         sensors: false,
@@ -567,28 +516,6 @@ fn run_core(
         sitl: None,
         terrain: None,
         track: None,
-    })
-}
-
-fn write_sample(
-    w: &mut RecordWriter,
-    t: f64,
-    quad: &Quad,
-    wind: Option<DVec3>,
-    fc: Option<FcSample>,
-) -> io::Result<()> {
-    w.write_sample(&Sample {
-        t,
-        pos: quad.state.pos,
-        vel: quad.state.vel,
-        quat: quad.state.quat,
-        omega: quad.state.omega,
-        rpm: quad.rpm,
-        i_mot: quad.i_mot,
-        vbus: quad.bus_voltage(),
-        soc: quad.soc(),
-        wind,
-        fc,
     })
 }
 
@@ -1085,14 +1012,6 @@ fn wait_msp_ready(guard: &mut SitlProc) -> Result<MspLink, String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn pct(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let i = ((q * (sorted.len() - 1) as f64) as usize).min(sorted.len() - 1);
-    sorted[i]
 }
 
 /// summary.json: run facts, provenance, and the quantitative acceptance
