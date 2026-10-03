@@ -1,6 +1,9 @@
 /target
 *.swp
-/tools/godot/
+# the pinned editor binary stays untracked; the checksum list it must be
+# verified against is tracked (it comes from Godot's official release)
+/tools/godot/*
+!/tools/godot/SHA512-SUMS.txt
 __pycache__/
 /tools/godot_smoke/pack/
 /tools/godot_smoke/record/

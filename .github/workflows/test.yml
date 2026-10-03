@@ -29,6 +29,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # area_pack's tests shell out to tools/area_pack.py, which imports
+      # numpy + tifffile on the GLO-30 path
+      - run: pip install numpy tifffile
       - run: cargo test
 
   godot-replay:
@@ -38,6 +44,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # T8's bundle-vs-regen comparison runs tools/godot_smoke/make_bundle.sh
+      - run: pip install numpy tifffile
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
       - name: Install pinned Godot (sha512-verified against the committed sums)
