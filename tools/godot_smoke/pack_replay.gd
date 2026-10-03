@@ -1,5 +1,6 @@
 # T7 area-pack replay: builds the Godot scene from a darter area pack
-# (env DARTER_PACK = pack directory with pack.json + scene.obj) and replays a
+# (env DARTER_PACK = pack directory with pack.json + scene.obj, or
+# env DARTER_AREA = bundled demo area under res://areas/<name>/) and replays a
 # darter flight record through it, same Movie Maker replay contract as
 # replay.gd (env DARTER_RECORD, env DARTER_REPLAY_OUT).
 #
@@ -143,6 +144,11 @@ var gate_nodes: Array = []
 var gate_mats: Array = []
 var track_hud: Label
 
+# Demo area when the ladder resolved the pack via DARTER_AREA ("" = none).
+# Gates the pack block's "area" member: it is emitted ONLY on this path, so
+# the DARTER_PACK emit stays byte-identical to the T7 canon.
+var area_name := ""
+
 # Lighting preset (S1 art pass). Selected by env DARTER_LIGHTING; the tests
 # never set it, so the default pins the canon run.
 const LIGHTING_PRESETS := preload("lighting_presets.gd")
@@ -154,16 +160,22 @@ func _ready() -> void:
 	# before _obj_to_mesh runs.
 	_build_world()
 	sample_every = 4 if OS.has_feature("android") else 1
-	sample_every = 4 if OS.has_feature("android") else 1
 	var env_se := OS.get_environment("DARTER_SAMPLE_EVERY")
 	if env_se != "":
 		sample_every = maxi(1, int(env_se))
 	_load_pack_and_build_scene()
 	_load_track()
-	# Bundled record fallback, same reason as the pack (see above).
+	# Record resolution ladder (S5): DARTER_RECORD > the DARTER_AREA area's
+	# bundled record.jsonl > hard error. The legacy res://record fallback is
+	# gone with it.
 	var path := OS.get_environment("DARTER_RECORD")
 	if path == "":
-		path = "res://record/flight.jsonl"
+		if area_name != "":
+			path = "res://areas/%s/record.jsonl" % area_name
+		else:
+			push_error("no record resolution: set DARTER_RECORD to a flight record, or DARTER_AREA to a demo area")
+			get_tree().quit(1)
+			return
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
 		push_error("cannot open record %s" % path)
@@ -189,12 +201,56 @@ func _ready() -> void:
 	last_usec = Time.get_ticks_usec()
 
 
+func _area_names_from_index() -> Array:
+	# Area names from the bundled index, [] when it is missing or malformed
+	# (the ladder's error text then degrades to naming the envs alone).
+	var names: Array = []
+	var f := FileAccess.open("res://areas/index.json", FileAccess.READ)
+	if f == null:
+		return names
+	var j = JSON.parse_string(f.get_as_text())
+	if typeof(j) != TYPE_DICTIONARY:
+		return names
+	var arr = j.get("areas")
+	if typeof(arr) != TYPE_ARRAY:
+		return names
+	for row in arr:
+		if typeof(row) == TYPE_DICTIONARY and typeof(row.get("name")) == TYPE_STRING:
+			names.append(row.get("name"))
+	return names
+
+
 func _load_pack_and_build_scene() -> void:
-	# Android launches carry no environment: fall back to the pack bundled in
-	# the APK (tools/godot_smoke/pack, gitignored; local builds only).
-	var dir := OS.get_environment("DARTER_PACK")
-	if dir == "":
-		dir = "res://pack"
+	# Pack resolution ladder (S5): DARTER_PACK (the T7 corridor path,
+	# byte-identical emit) > DARTER_AREA (a bundled demo area,
+	# res://areas/<name>/) > hard error naming both envs and the area list.
+	# The legacy res://pack fallback is gone: a no-env run fails loudly
+	# instead of silently replaying whatever the last local build left in
+	# the project tree.
+	var dir := ""
+	var env_area := OS.get_environment("DARTER_AREA")
+	if OS.get_environment("DARTER_PACK") != "":
+		dir = OS.get_environment("DARTER_PACK")
+	elif env_area != "":
+		var names := _area_names_from_index()
+		if not names.has(env_area):
+			push_error("DARTER_AREA \"%s\" is not in areas/index.json; areas: %s" % [
+				env_area, ", ".join(names)
+			])
+			get_tree().quit(1)
+			return
+		area_name = env_area
+		dir = "res://areas/%s" % env_area
+	else:
+		var names := _area_names_from_index()
+		if names.is_empty():
+			push_error("no pack resolution: set DARTER_PACK to a pack directory (pack.json + scene.obj), or DARTER_AREA to a demo area (index missing: res://areas/index.json)")
+		else:
+			push_error("no pack resolution: set DARTER_PACK to a pack directory (pack.json + scene.obj), or DARTER_AREA to one of %d demo areas: %s" % [
+				names.size(), ", ".join(names)
+			])
+		get_tree().quit(1)
+		return
 	var t0 := Time.get_ticks_usec()
 
 	var pf := FileAccess.open(dir + "/pack.json", FileAccess.READ)
@@ -271,10 +327,14 @@ func _load_pack_and_build_scene() -> void:
 	cam.near = 1.0
 
 	# The summary is written after the last frame (in _process); keep the
-	# pack block around until then.
+	# pack block around until then. The "area" member appears ONLY when the
+	# ladder resolved the pack via DARTER_AREA; the DARTER_PACK path's emit
+	# stays byte-identical to the T7 canon.
 	set_meta("pack_json",
-		"\"pack\":{\"load_ms\":%d,\"materials\":%d,%s\"groups\":{%s}}" % [
-			load_ms, MATERIAL_ORDER.size(), relief_json, groups_json
+		"\"pack\":{\"load_ms\":%d,\"materials\":%d,%s%s\"groups\":{%s}}" % [
+			load_ms, MATERIAL_ORDER.size(),
+			"" if area_name == "" else "\"area\":\"%s\"," % area_name,
+			relief_json, groups_json
 		])
 
 
@@ -503,8 +563,6 @@ func _build_world() -> void:
 	if env_exposure != "":
 		preset["tonemap_exposure"] = float(env_exposure)
 	lighting = preset
-	if env_exposure != "":
-		preset["tonemap_exposure"] = float(env_exposure)
 
 	var env := Environment.new()
 	var sky := Sky.new()
@@ -520,23 +578,27 @@ func _build_world() -> void:
 	LIGHTING_PRESETS.apply(preset, env, sky_mat, sun)
 
 
-# Track precedence: DARTER_TRACK env when set; else the APK-bundled demo
-# (res://track/demo_track.json) only on Android — the device plays the demo
-# with no env plumbing; else disabled (desktop with no env keeps today's
-# base path and byte-identical replay). A missing env-pointed file is a hard
-# quit; a missing Android fallback is a soft skip (print, no track features).
-# Validation mirrors parse() in src/bin/sim_run/track.rs — the renderer must
-# accept exactly what the Rust CLI accepts, with hard errors too.
+# Track precedence (S5): DARTER_TRACK env when set; else the DARTER_AREA
+# area's bundled track.json (missing = hard error — a broken bundle); else
+# the APK-bundled demo (res://track/demo_track.json) on Android only and
+# only when DARTER_AREA is unset; else disabled (desktop with no env has no
+# track). A missing env-pointed file is a hard quit; the Android legacy
+# fallback stays a soft skip (print, no track features). Validation mirrors
+# parse() in src/bin/sim_run/track.rs — the renderer must accept exactly
+# what the Rust CLI accepts, with hard errors too.
 func _load_track() -> void:
 	var env_path := OS.get_environment("DARTER_TRACK")
 	var path := env_path
 	if path == "":
-		if not OS.has_feature("android"):
+		if area_name != "":
+			path = "res://areas/%s/track.json" % area_name
+		elif OS.has_feature("android"):
+			path = "res://track/demo_track.json"
+		else:
 			return
-		path = "res://track/demo_track.json"
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
-		if env_path == "" and OS.has_feature("android"):
+		if env_path == "" and area_name == "" and OS.has_feature("android"):
 			print("TRACK_SKIPPED missing %s" % path)
 			return
 		push_error("cannot open track %s" % path)

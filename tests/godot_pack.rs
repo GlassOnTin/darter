@@ -496,10 +496,8 @@ fn run_godot(
 
 /// The device-path run (T8 gate d): the loader gets ONLY the area name and
 /// the replay-out path; pack, record and track must come from
-/// `res://areas/<name>/` on the selection ladder (S5). Until the ladder
-/// lands this run exercises whatever the loader currently does with the
-/// unknown env — today the silent legacy res://pack fallback — which is
-/// exactly the regression T8 must catch.
+/// `res://areas/<name>/` on the selection ladder — the same resolution the
+/// APK export will use. The DARTER_PACK path stays untouched and T7-covered.
 fn run_godot_area(godot: &Path, project: &Path, dir: &Path, area: &str) -> Result<(), String> {
     let mut cmd = Command::new("xvfb-run");
     cmd.arg("-a").arg(godot);
@@ -744,19 +742,36 @@ struct AreaSpec {
     /// The track file the record flies (suburb reuses the committed corridor
     /// track; the other three land at S3).
     track: &'static str,
-    /// Pixel floors: corridor's measured canon for suburb; the three new
-    /// areas carry PENDING_FLOORS (the gate self-reds) until S5 pins the
-    /// measured floors from the first full pass with a dated comment.
+    /// Pixel floors: the measured DARTER_AREA canon per area (the three new
+    /// areas pin from their first full pass; suburb keeps the corridor
+    /// constants it is byte-identical to). All are dated measured facts.
     floors: PixelFloors,
 }
 
-/// Unpinned-floor sentinel: Infinity fails every gate, so T8 stays red until
-/// S5 replaces it with measured numbers. Deliberately not a lookable "0".
-const PENDING_FLOORS: PixelFloors = PixelFloors {
-    mean_veg: f64::INFINITY,
-    min_veg: f64::INFINITY,
-    mean_mm: f64::INFINITY,
-    min_mm: f64::INFINITY,
+/// Unpinned-floor sentinel was Infinity until S5; per-area floors below are
+/// pinned from the first full DARTER_AREA pass (deterministic projection,
+/// gl_compatibility desktop canon, sample_every=1) with the corridor's
+/// margin convention: every floor at ~half the measured value — the
+/// measured pass is exact, so these doors sit well below the canon.
+const CITY_FLOORS: PixelFloors = PixelFloors {
+    mean_veg: 0.19, // measured 0.394 (2026-10-03)
+    min_veg: 0.09,  // measured min 0.184
+    mean_mm: 0.18,  // measured 0.364
+    min_mm: 0.14,   // measured min 0.295
+};
+
+const COAST_FLOORS: PixelFloors = PixelFloors {
+    mean_veg: 0.31, // measured 0.634 (2026-10-03)
+    min_veg: 0.26,  // measured min 0.528
+    mean_mm: 0.17,  // measured 0.345
+    min_mm: 0.13,   // measured min 0.276
+};
+
+const HILLS_FLOORS: PixelFloors = PixelFloors {
+    mean_veg: 0.27, // measured 0.546 (2026-10-03)
+    min_veg: 0.23,  // measured min 0.473
+    mean_mm: 0.18,  // measured 0.379
+    min_mm: 0.15,   // measured min 0.312
 };
 
 const AREAS: &[AreaSpec] = &[
@@ -771,7 +786,7 @@ const AREAS: &[AreaSpec] = &[
         alt: 30,
         vx: -14.0,
         track: "tools/godot_smoke/track/city.json",
-        floors: PENDING_FLOORS,
+        floors: CITY_FLOORS,
     },
     AreaSpec {
         name: "suburb",
@@ -797,7 +812,7 @@ const AREAS: &[AreaSpec] = &[
         alt: 30,
         vx: -14.0,
         track: "tools/godot_smoke/track/coast.json",
-        floors: PENDING_FLOORS,
+        floors: COAST_FLOORS,
     },
     AreaSpec {
         name: "hills",
@@ -810,7 +825,7 @@ const AREAS: &[AreaSpec] = &[
         alt: 60,
         vx: -14.0,
         track: "tools/godot_smoke/track/hills.json",
-        floors: PENDING_FLOORS,
+        floors: HILLS_FLOORS,
     },
 ];
 
