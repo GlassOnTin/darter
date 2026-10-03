@@ -26,7 +26,9 @@
 //!
 //! Opt-in (`cargo test --test godot_pack -- --ignored`) like tests/godot.rs:
 //! it needs the pinned Godot binary (same provenance gate) plus the cached
-//! Overpass fixture for the pack build. The render path is xvfb +
+//! Overpass fixture for the pack build. T8 `demo_areas` (same opt-in) gates
+//! the curated demo-areas rung: index + tracks + envelope + the DARTER_AREA
+//! device path + the picker; it stays red through slice S5's landings. The render path is xvfb +
 //! gl_compatibility only — T5 measured the headless path as impossible on
 //! this machine (dummy render device; viewport read SIGSEGVs), so it is not
 //! retried here.
@@ -189,9 +191,37 @@ fn parse_replay(path: &Path) -> (usize, Vec<Sample>, PackSummary) {
     (frames, samples, pack)
 }
 
-/// The gates: frame count, positions vs the record, non-blank brightness,
-/// and scene content (vegetation + man-made fractions). Returns a summary.
+/// Per-area render-content floors: the pixel-class gates that are scene
+/// dependent (the rest of validate_with's gates are scene-agnostic).
+#[derive(Clone, Copy, Debug)]
+struct PixelFloors {
+    mean_veg: f64,
+    min_veg: f64,
+    mean_mm: f64,
+    min_mm: f64,
+}
+
+/// T7's corridor floors, exactly the pre-refactor literals (2026-10-03 canon:
+/// veg mean 0.417 / min 0.339, mm mean 0.422 / min 0.335 run far above them).
+const CORRIDOR_FLOORS: PixelFloors = PixelFloors {
+    mean_veg: 0.20,
+    min_veg: 0.10,
+    mean_mm: 0.12,
+    min_mm: 0.10,
+};
+
+/// T7's wrapper: signature and corridor numbers unchanged.
 fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<String, String> {
+    validate_with(replay, record_rows, CORRIDOR_FLOORS)
+}
+
+/// The parameterized core (T8's demo areas fly different scenes; each area
+/// carries its own measured floors in the AREAS table, pinned at S5).
+fn validate_with(
+    replay: &Path,
+    record_rows: &[(f64, f64, f64, f64)],
+    floors: PixelFloors,
+) -> Result<String, String> {
     let (frames, samples, _pack) = parse_replay(replay);
     if frames != EXPECTED_FRAMES {
         return Err(format!("frames {frames} vs expected {EXPECTED_FRAMES}"));
@@ -235,11 +265,14 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
         return Err(format!("mean brightness {mean_bm:.3} outside (0.02, 0.98)"));
     }
     // Empty scene (loader failure): fog + sky only -> no green at all.
-    if mean_veg < 0.20 {
-        return Err(format!("mean vegetation fraction {mean_veg:.3} < 0.20 (scene empty?)"));
+    if mean_veg < floors.mean_veg {
+        return Err(format!(
+            "mean vegetation fraction {mean_veg:.3} < {} (scene empty?)",
+            floors.mean_veg
+        ));
     }
-    if min_veg < 0.10 {
-        return Err(format!("min vegetation fraction {min_veg:.3} < 0.10"));
+    if min_veg < floors.min_veg {
+        return Err(format!("min vegetation fraction {min_veg:.3} < {}", floors.min_veg));
     }
     // Man-made content: buildings/roads fill part of every frame. The
     // measured mins/means on the fixture pack were ~0.44/~0.52 under the
@@ -262,11 +295,11 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     // M1 track rung (gate rings + HUD over the corridor): mean_bm 0.634,
     // veg 0.417 (min 0.339), mm 0.422 (min 0.335), sky 0.1612 — every
     // floor holds with wide margins, no re-baseline (2026-10-03).
-    if mean_mm < 0.12 {
-        return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
+    if mean_mm < floors.mean_mm {
+        return Err(format!("mean man-made fraction {mean_mm:.3} < {}", floors.mean_mm));
     }
-    if min_mm < 0.10 {
-        return Err(format!("min man-made fraction {min_mm:.3} < 0.10"));
+    if min_mm < floors.min_mm {
+        return Err(format!("min man-made fraction {min_mm:.3} < {}", floors.min_mm));
     }
     if mean_sky < 0.005 {
         return Err(format!("mean sky fraction {mean_sky:.4} < 0.005"));
@@ -325,25 +358,25 @@ fn fnum_in(text: &str, key: &str) -> f64 {
     rest[..end].trim().parse().expect("f64 parse")
 }
 
-/// Build the area pack from the cached fixture (offline): GLO-30 relief via
-/// the committed fixture DEM (the flagship glo30 path; the flat contract
-/// stays covered by tests/area_pack.rs).
-fn build_pack(dir: &Path) {
+/// Build an area pack from a fixture pair (offline): GLO-30 relief via the
+/// committed fixture DEM (the flagship glo30 path; the flat contract stays
+/// covered by tests/area_pack.rs).
+fn build_pack_for(dir: &Path, osm: &str, lat: f64, lon: f64, dem: &str, seed: u64) {
     let out = Command::new("python3")
         .args([
             "tools/area_pack.py",
             "--osm",
-            FIXTURE,
+            osm,
             "--lat",
-            &HOME_LAT.to_string(),
+            &lat.to_string(),
             "--lon",
-            &HOME_LON.to_string(),
+            &lon.to_string(),
             "--elevation",
             "glo30",
             "--dem-file",
-            "tests/fixtures/dem_home_area.tif",
+            dem,
             "--seed",
-            &SEED.to_string(),
+            &seed.to_string(),
             "--out",
         ])
         .arg(dir)
@@ -355,6 +388,18 @@ fn build_pack(dir: &Path) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The T7 corridor home pack.
+fn build_pack(dir: &Path) {
+    build_pack_for(
+        dir,
+        FIXTURE,
+        HOME_LAT,
+        HOME_LON,
+        "tests/fixtures/dem_home_area.tif",
+        SEED,
+    )
 }
 
 /// The loader's group counts must equal pack.json's counts, family by family
@@ -447,6 +492,56 @@ fn run_godot(
             format!("{summary}; {pngs} PNG frames")
         })
         .map_err(|e| format!("{e}\n{log}"))
+}
+
+/// The device-path run (T8 gate d): the loader gets ONLY the area name and
+/// the replay-out path; pack, record and track must come from
+/// `res://areas/<name>/` on the selection ladder (S5). Until the ladder
+/// lands this run exercises whatever the loader currently does with the
+/// unknown env — today the silent legacy res://pack fallback — which is
+/// exactly the regression T8 must catch.
+fn run_godot_area(godot: &Path, project: &Path, dir: &Path, area: &str) -> Result<(), String> {
+    let mut cmd = Command::new("xvfb-run");
+    cmd.arg("-a").arg(godot);
+    cmd.arg("--path").arg(project);
+    cmd.arg("--rendering-method").arg("gl_compatibility");
+    cmd.arg("--rendering-driver").arg("opengl3");
+    let out_json = dir.join("replay.json");
+    std::fs::create_dir_all(dir).expect("create run dir");
+    cmd.arg("--write-movie")
+        .arg(dir.join("movie.png"))
+        .arg("--fixed-fps")
+        .arg(format!("{MOVIE_FPS}"))
+        .arg("--quit-after")
+        .arg(format!("{}", EXPECTED_FRAMES + 10))
+        .arg("res://pack_replay.tscn")
+        .env("DARTER_AREA", area)
+        .env("DARTER_REPLAY_OUT", &out_json);
+    let out = cmd.output().expect("spawn godot");
+    let log = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        return Err(format!("exit {:?}\n{log}", out.status.code()));
+    }
+    if !out_json.exists() {
+        return Err(format!("no replay JSON written\n{log}"));
+    }
+    Ok(())
+}
+
+/// The replay pack block's "area" member, if the loader emitted one. S5 sets
+/// it ONLY on DARTER_AREA runs; the DARTER_PACK path must emit the pack
+/// block byte-identical to the T7 canon (no area member there).
+fn parse_area_field(replay: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(replay).ok()?;
+    let i = text.find("\"pack\":{")?;
+    let j = text[i..].find("\"samples\":[").map(|k| i + k).unwrap_or(text.len());
+    let header = &text[i..j];
+    let k = header.find("\"area\":\"")?;
+    Some(header[k + "\"area\":\"".len()..].split('"').next()?.to_string())
 }
 
 /// The T7 integration: pack build -> record -> render -> gates -> counts ->
@@ -618,5 +713,366 @@ fn parse_track_block_parses_events() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0][0], serde_json::json!(0));
     assert_eq!(events[1][1], serde_json::json!(2.75));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- T8: the curated demo-areas rung (city, suburb, coast, hills) ----
+
+/// The attribution string VISION.md requires to be visible, verbatim: the
+/// picker footer and index.json's field both carry exactly this.
+const ATTRIBUTION: &str =
+    "© OpenStreetMap contributors, ODbL 1.0 | © Copernicus DEM / ESA (GLO-30)";
+
+/// The four curated areas, in index.json order (S3 authors index.json in
+/// this order; T8's picker assertion pins it). Sites/seeds: the approved
+/// plan's table, with S1's two dated origin nudges folded in (coast Calshot
+/// Spit -> Stone shore 50.8130/-1.3070; hills Butser -> 50.9761/-0.9457 so
+/// the 4530 m grid stays inside tile N50_00_W001_00 — both committed with
+/// the fixture pins in tests/area_pack.rs).
+struct AreaSpec {
+    name: &'static str,
+    osm: &'static str,
+    dem: &'static str,
+    lat: f64,
+    lon: f64,
+    /// area_pack build seed.
+    seed: u64,
+    /// The record: per-area sim_run seed, start altitude, straight-line vx.
+    rec_seed: u64,
+    alt: u32,
+    vx: f64,
+    /// The track file the record flies (suburb reuses the committed corridor
+    /// track; the other three land at S3).
+    track: &'static str,
+    /// Pixel floors: corridor's measured canon for suburb; the three new
+    /// areas carry PENDING_FLOORS (the gate self-reds) until S5 pins the
+    /// measured floors from the first full pass with a dated comment.
+    floors: PixelFloors,
+}
+
+/// Unpinned-floor sentinel: Infinity fails every gate, so T8 stays red until
+/// S5 replaces it with measured numbers. Deliberately not a lookable "0".
+const PENDING_FLOORS: PixelFloors = PixelFloors {
+    mean_veg: f64::INFINITY,
+    min_veg: f64::INFINITY,
+    mean_mm: f64::INFINITY,
+    min_mm: f64::INFINITY,
+};
+
+const AREAS: &[AreaSpec] = &[
+    AreaSpec {
+        name: "city",
+        osm: "tests/fixtures/osm_city.json",
+        dem: "tests/fixtures/dem_city.tif",
+        lat: 50.9060,
+        lon: -1.4012,
+        seed: 11,
+        rec_seed: 21,
+        alt: 30,
+        vx: -14.0,
+        track: "tools/godot_smoke/track/city.json",
+        floors: PENDING_FLOORS,
+    },
+    AreaSpec {
+        name: "suburb",
+        osm: FIXTURE,
+        dem: "tests/fixtures/dem_home_area.tif",
+        lat: HOME_LAT,
+        lon: HOME_LON,
+        seed: SEED,
+        rec_seed: 7,
+        alt: 35,
+        vx: -14.0,
+        track: DEMO_TRACK,
+        floors: CORRIDOR_FLOORS,
+    },
+    AreaSpec {
+        name: "coast",
+        osm: "tests/fixtures/osm_coast.json",
+        dem: "tests/fixtures/dem_coast.tif",
+        lat: 50.8130,
+        lon: -1.3070,
+        seed: 13,
+        rec_seed: 23,
+        alt: 30,
+        vx: -14.0,
+        track: "tools/godot_smoke/track/coast.json",
+        floors: PENDING_FLOORS,
+    },
+    AreaSpec {
+        name: "hills",
+        osm: "tests/fixtures/osm_hills.json",
+        dem: "tests/fixtures/dem_hills.tif",
+        lat: 50.9761,
+        lon: -0.9457,
+        seed: 17,
+        rec_seed: 29,
+        alt: 60,
+        vx: -14.0,
+        track: "tools/godot_smoke/track/hills.json",
+        floors: PENDING_FLOORS,
+    },
+];
+
+/// (e) The bundle payload must be byte-identical to the offline regen for
+/// every staged file. The suburb row's equality doubles as the proof that
+/// T7's pack build == the bundled suburb payload.
+fn assert_bundle_matches_regen(area: &str, regen: &Path) {
+    let bundle = PathBuf::from(format!("tools/godot_smoke/areas/{area}"));
+    let track = AREAS
+        .iter()
+        .find(|x| x.name == area)
+        .expect("area in table")
+        .track;
+    let pairs = [
+        (bundle.join("pack.json"), regen.join("pack.json")),
+        (bundle.join("scene.packobj"), regen.join("scene.obj")),
+        (bundle.join("record.jsonl"), regen.join("flight.jsonl")),
+        (bundle.join("track.json"), PathBuf::from(track)),
+    ];
+    for (bundle_path, regen_path) in pairs {
+        let b = std::fs::read(&bundle_path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e} (bundle stale or missing; run make_bundle.sh)", bundle_path.display()));
+        let r = std::fs::read(&regen_path).expect("regen payload");
+        assert_eq!(b, r, "bundle vs regen drift: {}", bundle_path.display());
+    }
+}
+
+/// The demo-areas run gate (Slices S2..S6; red at the first missing slice,
+/// green by S6). Per area, in order: (a) offline regen pack build from the
+/// committed fixtures + validator exit 0; (b) sim_run record with the
+/// per-area track + determinism: 6 checkpoints, chronological events, all
+/// crossings <= 19.0 s, >= 5000 rows; (c) envelope_check exit 0; (e) bundle-
+/// vs-regen byte equality (currency proof before anything runs the bundle);
+/// (d) the device path — the loader resolves pack/record/track from
+/// `res://areas/<name>/` given ONLY DARTER_AREA, with counts, relief echo,
+/// per-area pixel floors, the area member and the track mirror matching the
+/// CLI. Then: (f) hills determinism re-run; (g) the picker prints
+/// PICKER_READY with the four areas + the verbatim attribution; (h) a bare
+/// run hard-errors naming DARTER_PACK, DARTER_AREA and the four areas (the
+/// legacy res://pack/res://record fallbacks are gone).
+#[test]
+#[ignore = "needs tools/godot/bin/godot (pinned 4.7.2-stable) + xvfb; run: cargo test --test godot_pack -- --ignored"]
+fn demo_areas() {
+    let godot = locate_godot();
+    let project = PathBuf::from("tools/godot_smoke");
+    let dir = temp_dir("demo");
+
+    // The index gate first (S3 authors it to the asserted shape): schema,
+    // table order, track refs, and the attribution string the picker must
+    // print verbatim.
+    let index_path = project.join("areas/index.json");
+    let index_text = std::fs::read_to_string(&index_path)
+        .expect("tools/godot_smoke/areas/index.json missing (S3)");
+    let index: serde_json::Value = serde_json::from_str(&index_text).expect("index parses");
+    assert_eq!(index["schema"], "darter_areas", "index schema");
+    assert_eq!(index["version"], 1, "index version");
+    let idx_areas = index["areas"].as_array().expect("index areas array");
+    assert_eq!(idx_areas.len(), AREAS.len(), "index area count");
+    for (row, spec) in idx_areas.iter().zip(AREAS) {
+        assert_eq!(row["name"].as_str().expect("area name"), spec.name, "index order");
+        assert_eq!(row["track"].as_str().expect("track ref"), spec.track, "track ref");
+    }
+    assert_eq!(index["attribution"].as_str().expect("attribution"), ATTRIBUTION);
+
+    for spec in AREAS {
+        let regen = dir.join(spec.name);
+
+        // (a) offline regen + validator exit 0.
+        build_pack_for(&regen, spec.osm, spec.lat, spec.lon, spec.dem, spec.seed);
+        let v = Command::new("python3")
+            .args(["tools/area_pack.py"])
+            .arg(&regen)
+            .output()
+            .expect("spawn validator");
+        assert!(
+            v.status.success(),
+            "{}: regen validator failed: {}{}",
+            spec.name,
+            String::from_utf8_lossy(&v.stdout),
+            String::from_utf8_lossy(&v.stderr)
+        );
+
+        // (b) record on the regen terrain, flying the area's track.
+        let rec_dir = dir.join(format!("{}-rec", spec.name));
+        let out = Command::new(env!("CARGO_BIN_EXE_sim_run"))
+            .args([
+                "--seed",
+                &spec.rec_seed.to_string(),
+                "--duration",
+                "20",
+                "--alt",
+                &spec.alt.to_string(),
+                "--throttle",
+                "0.157",
+                "--vx",
+                &spec.vx.to_string(),
+                "--determinism-check",
+                "--terrain",
+            ])
+            .arg(regen.join("terrain.bin"))
+            .arg("--track")
+            .arg(spec.track)
+            .arg("--out")
+            .arg(&rec_dir)
+            .output()
+            .expect("spawn sim_run");
+        assert!(
+            out.status.success(),
+            "{}: sim_run failed: {}",
+            spec.name,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let record = rec_dir.join("flight.jsonl");
+        let rows = read_record(&record);
+        assert!(rows.len() >= 5000, "{}: record too short {}", spec.name, rows.len());
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(rec_dir.join("summary.json")).expect("summary"),
+        )
+        .expect("summary.json parses");
+        let trk = summary.get("track").expect("summary carries the track block");
+        assert_eq!(trk["checkpoints"], serde_json::json!(6), "{}: gate count", spec.name);
+        assert_eq!(trk["loop"], serde_json::json!(false), "{}: demo is open", spec.name);
+        let evs = trk["events"].as_array().expect("CLI events array");
+        assert_eq!(evs.len(), 6, "{}: all gates threaded: {evs:?}", spec.name);
+        let mut last_t = 0.0f64;
+        for (k, e) in evs.iter().enumerate() {
+            assert_eq!(
+                e[0].as_u64().expect("event index"),
+                k as u64,
+                "{}: chronological gate order",
+                spec.name
+            );
+            let t = e[1].as_f64().expect("event time");
+            assert!(t > last_t, "{}: event times strictly increasing", spec.name);
+            assert!(t <= 19.0, "{}: crossing {t} s > 19.0", spec.name);
+            last_t = t;
+        }
+        println!("{}: cli track events {evs:?}", spec.name);
+
+        // (c) envelope: clearance pz - h_at >= 8 m on every row of the flown
+        // window; no row inside a generator building ring's bbox under the
+        // top cap.
+        let c = Command::new("python3")
+            .args(["tools/envelope_check.py"])
+            .arg(&regen)
+            .arg("--record")
+            .arg(&record)
+            .output()
+            .expect("spawn envelope_check.py");
+        assert!(
+            c.status.success(),
+            "{}: envelope_check failed: {}{}",
+            spec.name,
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+
+        // (e) bundle currency before anything runs it.
+        assert_bundle_matches_regen(spec.name, &regen);
+
+        // (d) the device path: DARTER_AREA only. Bundle == regen (e), so the
+        // gates read the regen record rows.
+        let run_dir = dir.join(format!("{}-run", spec.name));
+        let run = run_godot_area(&godot, &project, &run_dir, spec.name);
+        assert!(run.is_ok(), "{}: DARTER_AREA replay failed: {:?}", spec.name, run.err());
+        let replay = run_dir.join("replay.json");
+        let (frames, _samples, pack) = parse_replay(&replay);
+        assert_eq!(frames, EXPECTED_FRAMES, "{}: frame count", spec.name);
+        let bjson_path =
+            PathBuf::from(format!("tools/godot_smoke/areas/{}/pack.json", spec.name));
+        assert_pack_counts(&pack, &bjson_path);
+        let bjson = std::fs::read_to_string(&bjson_path).expect("area pack.json");
+        let elev = json_object(bjson.trim(), "elevation");
+        assert_eq!(
+            pack.relief,
+            Some((fnum_in(elev, "z_min"), fnum_in(elev, "z_max"))),
+            "{}: relief echo != pack.json elevation range",
+            spec.name
+        );
+        let summary = validate_with(&replay, &rows, spec.floors)
+            .unwrap_or_else(|e| panic!("{}: DARTER_AREA gates: {e}", spec.name));
+        assert_eq!(
+            parse_area_field(&replay).as_deref(),
+            Some(spec.name),
+            "{}: replay pack block must carry the area member",
+            spec.name
+        );
+        let rep = parse_track_block(&replay);
+        assert_track_events_match(&rep, evs, spec.name);
+        println!("{} DARTER_AREA: {summary}", spec.name);
+
+        // (f) hills determinism spot check: a second device-path run with
+        // the identical deterministic projection.
+        if spec.name == "hills" {
+            let again_dir = dir.join("hills-run2");
+            let again = run_godot_area(&godot, &project, &again_dir, "hills");
+            assert!(again.is_ok(), "hills second run failed: {:?}", again.err());
+            let (a_frames, a_samples, _) = parse_replay(&replay);
+            let (b_frames, b_samples, _) = parse_replay(&again_dir.join("replay.json"));
+            assert_eq!(a_frames, b_frames, "hills: frame count differs");
+            assert_eq!(canon(&a_samples), canon(&b_samples), "hills second replay diverged");
+        }
+    }
+
+    // (g) the picker: positional scene, no env; prints the area list with
+    // the attribution visible verbatim.
+    let pick_dir = dir.join("picker");
+    std::fs::create_dir_all(&pick_dir).unwrap();
+    let out = Command::new("xvfb-run")
+        .arg("-a")
+        .arg(&godot)
+        .arg("--path")
+        .arg(&project)
+        .arg("--rendering-method")
+        .arg("gl_compatibility")
+        .arg("--rendering-driver")
+        .arg("opengl3")
+        .arg("--quit-after")
+        .arg("5")
+        .arg("res://area_picker.tscn")
+        .output()
+        .expect("spawn godot for picker");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "picker exited early:\n{text}"
+    );
+    let want_line = format!(
+        "PICKER_READY areas={}",
+        AREAS.iter().map(|a| a.name).collect::<Vec<_>>().join(",")
+    );
+    assert!(text.contains(&want_line), "missing {want_line:?} in picker output:\n{text}");
+    assert!(text.contains(ATTRIBUTION), "attribution not printed verbatim\n{text}");
+
+    // (h) no-env hard error: pack_replay with no DARTER_* envs exits 1 and
+    // names both resolution options and the four areas (the legacy
+    // res://pack + res://record fallbacks are gone by S5).
+    let bare_dir = dir.join("bare");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    let out = Command::new("xvfb-run")
+        .arg("-a")
+        .arg(&godot)
+        .arg("--path")
+        .arg(&project)
+        .arg("res://pack_replay.tscn")
+        .output()
+        .expect("spawn godot bare");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "bare pack_replay must exit 1\n{text}");
+    for needle in ["DARTER_PACK", "DARTER_AREA", "city", "suburb", "coast", "hills"] {
+        assert!(
+            text.contains(needle),
+            "bare-run error does not name {needle}:\n{text}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
