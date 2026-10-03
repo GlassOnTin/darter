@@ -47,6 +47,11 @@ const HOME_LAT: f64 = 50.8989;
 const HOME_LON: f64 = -1.0586;
 const SEED: u64 = 5;
 
+/// The committed demo track (corridor_slalom): gate sites measured on this
+/// same T7-mirror corridor flight (on-line pz at x -15/-40/-70/-100/-130/
+/// -160, py == 0, speed 14 -> 6.06 m/s).
+const DEMO_TRACK: &str = "tools/godot_smoke/track/demo_track.json";
+
 fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("darter-godot-pack-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
@@ -254,6 +259,9 @@ fn validate(replay: &Path, record_rows: &[(f64, f64, f64, f64)]) -> Result<Strin
     // near-identical — mean_bm 0.649, veg 0.426 (min 0.376), mm 0.421
     // (min 0.366), sky 0.1529 (hills eat ~1 pt of horizon sky) — no
     // re-baseline.
+    // M1 track rung (gate rings + HUD over the corridor): mean_bm 0.634,
+    // veg 0.417 (min 0.339), mm 0.422 (min 0.335), sky 0.1612 — every
+    // floor holds with wide margins, no re-baseline (2026-10-03).
     if mean_mm < 0.12 {
         return Err(format!("mean man-made fraction {mean_mm:.3} < 0.12"));
     }
@@ -380,7 +388,14 @@ fn assert_pack_counts(pack: &PackSummary, pack_json: &Path) {
 }
 
 /// One full xvfb Godot Movie Maker run of the pack replay scene.
-fn run_godot(godot: &Path, project: &Path, dir: &Path, record: &Path, pack_dir: &Path) -> Result<String, String> {
+fn run_godot(
+    godot: &Path,
+    project: &Path,
+    dir: &Path,
+    record: &Path,
+    pack_dir: &Path,
+    track: Option<&Path>,
+) -> Result<String, String> {
     let mut cmd = Command::new("xvfb-run");
     cmd.arg("-a").arg(godot);
     cmd.arg("--path").arg(project);
@@ -400,6 +415,15 @@ fn run_godot(godot: &Path, project: &Path, dir: &Path, record: &Path, pack_dir: 
         .env("DARTER_RECORD", record)
         .env("DARTER_PACK", pack_dir)
         .env("DARTER_REPLAY_OUT", &out_json);
+    if let Some(track) = track {
+        // Godot's FileAccess resolves a relative path inside the project
+        // dir, so the env value must be absolute (tests run from the
+        // package root, where DEMO_TRACK is what the sim_run CLI wants).
+        cmd.env(
+            "DARTER_TRACK",
+            std::fs::canonicalize(track).expect("demo track path"),
+        );
+    }
     let out = cmd.output().expect("spawn godot");
     let log = format!(
         "stdout: {}\nstderr: {}",
@@ -461,6 +485,8 @@ fn godot_pack_replay() {
             "--terrain",
         ])
         .arg(pack_dir.join("terrain.bin"))
+        .arg("--track")
+        .arg(DEMO_TRACK)
         .arg("--out")
         .arg(&rec_dir)
         .output()
@@ -470,7 +496,7 @@ fn godot_pack_replay() {
     let record_rows = read_record(&record);
     assert!(record_rows.len() >= 5000, "record too short: {}", record_rows.len());
 
-    let first = run_godot(&godot, &project, &dir.join("a"), &record, &pack_dir);
+    let first = run_godot(&godot, &project, &dir.join("a"), &record, &pack_dir, Some(Path::new(DEMO_TRACK)));
     assert!(first.is_ok(), "pack replay failed: {:?}", first.err());
     println!("pack replay: {}", first.unwrap());
 
@@ -491,9 +517,45 @@ fn godot_pack_replay() {
         "relief echo != pack.json elevation range"
     );
 
+    // Track rung (M1): the corridor record threads all six demo gates via
+    // the CLI's post-hoc evaluation; the replay's renderer-side mirror must
+    // equal the CLI events (chronological gate order; |dt| <= 0.01 s — the
+    // mirror recomputes at display cadence from the same f64 formulas — the
+    // slack covers general-case row-pair divergence on curved approaches,
+    // documented in track.rs, not exercised by this straight-line track).
+    let summary_text = std::fs::read_to_string(rec_dir.join("summary.json")).expect("summary");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary.json parses");
+    let trk = summary.get("track").expect("summary carries the track block");
+    assert_eq!(trk["checkpoints"], serde_json::json!(6), "demo gate count");
+    assert_eq!(trk["loop"], serde_json::json!(false), "demo is open");
+    let cli_events = trk["events"].as_array().expect("CLI events array");
+    assert_eq!(cli_events.len(), 6, "all six gates threaded: {cli_events:?}");
+    println!(
+        "cli track events: {:?}",
+        cli_events
+            .iter()
+            .map(|e| (e[0].as_u64().unwrap(), e[1].as_f64().unwrap()))
+            .collect::<Vec<_>>()
+    );
+    for (k, e) in cli_events.iter().enumerate() {
+        assert_eq!(
+            e[0].as_u64().expect("event index"),
+            k as u64,
+            "chronological gate order"
+        );
+        assert!(
+            k == 0
+                || e[1].as_f64().unwrap() > cli_events[k - 1][1].as_f64().unwrap(),
+            "event times strictly increasing"
+        );
+    }
+    let rep_a = parse_track_block(&dir.join("a").join("replay.json"));
+    assert_track_events_match(&rep_a, cli_events, "run-a");
+
     // Determinism: second full run, identical deterministic projection
     // (positions, brightness, class fractions).
-    let again = run_godot(&godot, &project, &dir.join("b"), &record, &pack_dir);
+    let again = run_godot(&godot, &project, &dir.join("b"), &record, &pack_dir, Some(Path::new(DEMO_TRACK)));
     assert!(again.is_ok(), "second run failed: {:?}", again.err());
     let (b_frames, b_samples, _b_pack) = parse_replay(&dir.join("b").join("replay.json"));
     assert_eq!(frames, b_frames, "frame count differs between runs");
@@ -503,5 +565,58 @@ fn godot_pack_replay() {
         b_samples.len(),
         parse_replay(&dir.join("b").join("replay.json")).2.load_ms
     );
+    let rep_b = parse_track_block(&dir.join("b").join("replay.json"));
+    assert_track_events_match(&rep_b, cli_events, "run-b");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The replay/summary track block: the replay JSON is machine-authored
+/// fixed-order output, so the whole file parses and the block is one member.
+fn parse_track_block(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).expect("replay JSON");
+    let value: serde_json::Value =
+        serde_json::from_str(&text).expect("whole replay/summary JSON parses");
+    value
+        .get("track")
+        .expect("track block present").clone()
+}
+
+/// The renderer-side mirror must equal the CLI events: identical indices
+/// (chronological gate order), |dt| <= 0.01 s per event.
+fn assert_track_events_match(
+    block: &serde_json::Value,
+    cli_events: &[serde_json::Value],
+    what: &str,
+) {
+    assert_eq!(block["schema"], "darter_track", "{what}");
+    let evs = block["events"].as_array().unwrap_or_else(|| panic!("{what}: track events array"));
+    assert_eq!(evs.len(), cli_events.len(), "{what}: event count vs CLI");
+    for (a, b) in evs.iter().zip(cli_events) {
+        assert_eq!(a[0], b[0], "{what}: event index order");
+        let dt = (a[1].as_f64().unwrap() - b[1].as_f64().unwrap()).abs();
+        assert!(dt <= 0.01, "{what}: mirror vs CLI dt {dt} > 0.01");
+    }
+}
+
+/// parse_track_block pinned standalone (runs in the plain suite; the T7
+/// comparisons above rely on this parser).
+#[test]
+fn parse_track_block_parses_events() {
+    let dir = temp_dir("parse_track");
+    let path = dir.join("replay.json");
+    std::fs::write(
+        &path,
+        r#"{"movie_fps":30,"frames":2,"pack":{"load_ms":1},"track":{"schema":"darter_track","version":1,"name":"t","checkpoints":2,"loop":false,"events":[[0,1.5],[1,2.75]],"lap_splits":null},"samples":[]}"#,
+    )
+    .unwrap();
+    let trk = parse_track_block(&path);
+    assert_eq!(trk["name"], "t");
+    assert_eq!(trk["checkpoints"], serde_json::json!(2));
+    assert_eq!(trk["loop"], serde_json::json!(false));
+    assert!(trk["lap_splits"].is_null());
+    let events = trk["events"].as_array().expect("events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0][0], serde_json::json!(0));
+    assert_eq!(events[1][1], serde_json::json!(2.75));
     let _ = std::fs::remove_dir_all(&dir);
 }
