@@ -1,0 +1,89 @@
+# Release process: tagged commits (v*) get the Android demo APK attached to
+# a GitHub release. The build follows the recipe in the header of
+# tools/godot_smoke/export_presets.cfg verbatim: bundle from the committed
+# fixtures (make_bundle.sh, fully offline at build time), throwaway project
+# copy with the picker as main scene, android build template install, gradle
+# export. workflow_dispatch runs the same job once through to a DRAFT release
+# so the path can be verified without publishing; delete the draft when done.
+#
+# The export's debug-keystore fields are empty, so gradle uses the standard
+# debug keystore, auto-generated on the build machine (no developer home
+# path is pinned in the repo).
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Keep in sync with the Godot pin in tests/godot.rs and the sums file.
+      GODOT_ASSET: Godot_v4.7.2-stable_linux.x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Provisioning network is allowed in CI; make_bundle.sh and the export
+      # below touch none (F-Droid rule: no network at build time).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy tifffile
+      - name: Install pinned Godot (sha512-verified against the committed sums)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/godot.zip" \
+            https://github.com/godotengine/godot/releases/download/4.7.2-stable/"$GODOT_ASSET"
+          test "$(grep -cF '  '"$GODOT_ASSET" tools/godot/SHA512-SUMS.txt)" = 1
+          grep -F '  '"$GODOT_ASSET" tools/godot/SHA512-SUMS.txt \
+            | sed "s#  $GODOT_ASSET#  $RUNNER_TEMP/godot.zip#" > "$RUNNER_TEMP/godot.sums"
+          sha512sum -c "$RUNNER_TEMP/godot.sums"
+          mkdir -p tools/godot/bin
+          unzip -j -o "$RUNNER_TEMP/godot.zip" 'Godot_v4.7.2-stable_linux.x86_64' -d tools/godot/bin/
+          mv tools/godot/bin/Godot_v4.7.2-stable_linux.x86_64 tools/godot/bin/godot
+          chmod +x tools/godot/bin/godot
+          tools/godot/bin/godot --version
+      - name: Android SDK pieces (android-36 + build-tools 36.1.0)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.1.0"
+      - name: Build sim_run (debug) and the demo bundle, offline
+        run: |
+          cargo build --bin sim_run
+          tools/godot_smoke/make_bundle.sh
+      - name: Export the Android APK
+        run: |
+          cp -a tools/godot_smoke "$RUNNER_TEMP/export"
+          rm -rf "$RUNNER_TEMP/export/build"
+          sed -i 's#run/main_scene="res://replay.tscn"#run/main_scene="res://area_picker.tscn"#' \
+            "$RUNNER_TEMP/export/project.godot"
+          cp tools/godot_smoke/refresh_vote/refresh_vote.aar "$RUNNER_TEMP/export/addons/refresh_vote/"
+          rm -f "$RUNNER_TEMP/export/pack/scene.obj" "$RUNNER_TEMP/export/pack/"*.obj.import
+          mkdir -p "$RUNNER_TEMP/export/build"
+          tools/godot/bin/godot --headless --path "$RUNNER_TEMP/export" \
+            --install-android-build-template --export-debug Android 2>&1 | tail -5
+          test -f "$RUNNER_TEMP/export/build/darter-smoke.apk"
+          ls -l "$RUNNER_TEMP/export/build/darter-smoke.apk" >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach APK to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="$RUNNER_TEMP/export/build/darter-smoke.apk"
+          NOTES=".github/release-notes.md"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            cp "$APK" "$RUNNER_TEMP/darter-smoke-$GITHUB_REF_NAME.apk"
+            gh release create "$GITHUB_REF_NAME" \
+              "$RUNNER_TEMP/darter-smoke-$GITHUB_REF_NAME.apk#Darter demo APK (debug-signed)" \
+              --verify-tag --title "Darter $GITHUB_REF_NAME" --notes-file "$NOTES"
+          else
+            gh release create "ci-verify-$GITHUB_RUN_ID" "$APK#darter-smoke.apk" \
+              --draft --target "$GITHUB_SHA" --title "release-verify draft ($GITHUB_RUN_ID)" \
+              --notes-file "$NOTES"
+          fi

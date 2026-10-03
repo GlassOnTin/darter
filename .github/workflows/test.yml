@@ -1,0 +1,59 @@
+# CI for the darter repo, two tiers:
+#   cargo:        the offline `cargo test` suite (no GPU, no network).
+#   godot-replay: the #[ignore]d renderer suites (tests/godot.rs,
+#                 tests/godot_pack.rs), which need the pinned Godot 4.7.2
+#                 binary and an X display. The tests spawn their own
+#                 xvfb-run wrappers, so the job only needs xvfb installed.
+#
+# The Godot binary is downloaded from the official 4.7.2-stable GitHub
+# release and verified against tools/godot/SHA512-SUMS.txt (the release's
+# published sums, committed here); the test suites re-verify the extracted
+# binary's sha256 at runtime.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  godot-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Install pinned Godot (sha512-verified against the committed sums)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/godot.zip" \
+            https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip
+          test "$(grep -cF '  Godot_v4.7.2-stable_linux.x86_64.zip' tools/godot/SHA512-SUMS.txt)" = 1
+          grep -F '  Godot_v4.7.2-stable_linux.x86_64.zip' tools/godot/SHA512-SUMS.txt \
+            | sed "s#  Godot_v4.7.2-stable_linux.x86_64.zip#  $RUNNER_TEMP/godot.zip#" > "$RUNNER_TEMP/godot.sums"
+          sha512sum -c "$RUNNER_TEMP/godot.sums"
+          mkdir -p tools/godot/bin
+          unzip -j -o "$RUNNER_TEMP/godot.zip" 'Godot_v4.7.2-stable_linux.x86_64' -d tools/godot/bin/
+          mv tools/godot/bin/Godot_v4.7.2-stable_linux.x86_64 tools/godot/bin/godot
+          chmod +x tools/godot/bin/godot
+          tools/godot/bin/godot --version
+      - name: T5 record-to-movie replay smoke
+        run: cargo test --test godot -- --ignored
+      - name: T7 corridor + T8 demo-areas replay suites
+        run: cargo test --test godot_pack -- --ignored
