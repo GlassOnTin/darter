@@ -64,6 +64,16 @@ jobs:
           mv tools/godot/bin/Godot_v4.7.2-stable_linux.x86_64 tools/godot/bin/godot
           chmod +x tools/godot/bin/godot
           tools/godot/bin/godot --version
+      - name: Build sim_run and regenerate the demo bundle (areas/ is gitignored payload)
+        run: |
+          cargo build --bin sim_run
+          tools/godot_smoke/make_bundle.sh
+      # Game-mode runs only consume the project's import cache (.godot/); a
+      # fresh checkout has none, so run the editor's import pass once.
+      # Verified 2026-10-03 from a wiped cache: exit 0 and the s3tc ctex
+      # files the replay scripts preload land in .godot/imported/.
+      - name: Import project resources (headless editor pass)
+        run: tools/godot/bin/godot --headless --path tools/godot_smoke --import
       - name: T5 record-to-movie replay smoke
         run: cargo test --test godot -- --ignored
       - name: T7 corridor + T8 demo-areas replay suites

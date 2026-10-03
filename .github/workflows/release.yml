@@ -67,7 +67,12 @@ jobs:
           cp tools/godot_smoke/refresh_vote/refresh_vote.aar "$RUNNER_TEMP/export/addons/refresh_vote/"
           rm -f "$RUNNER_TEMP/export/pack/scene.obj" "$RUNNER_TEMP/export/pack/"*.obj.import
           mkdir -p "$RUNNER_TEMP/export/build"
+          # Fresh checkouts carry no .godot import cache (the export's own
+          # first scan is not proven to import before packing); proven path
+          # is a separate headless import pass first.
+          tools/godot/bin/godot --headless --path "$RUNNER_TEMP/export" --import
           tools/godot/bin/godot --headless --path "$RUNNER_TEMP/export" \
+            --install-android-build-template --export-debug Android 2>&1 | tail -5
             --install-android-build-template --export-debug Android 2>&1 | tail -5
           test -f "$RUNNER_TEMP/export/build/darter-smoke.apk"
           ls -l "$RUNNER_TEMP/export/build/darter-smoke.apk" >> "$GITHUB_STEP_SUMMARY"
