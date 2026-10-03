@@ -1,0 +1,14 @@
+{
+  "schema": "darter_track",
+  "version": 1,
+  "name": "hills_valley_transit",
+  "spawn": {"x": 0.0, "y": 0.0, "z": -1.550},
+  "checkpoints": [
+    {"kind": "gate", "x": -15.0, "y": 0.0, "z": -2.223, "radius_m": 4.0},
+    {"kind": "gate", "x": -45.0, "y": 0.0, "z": -3.084, "radius_m": 4.0},
+    {"kind": "gate", "x": -75.0, "y": 0.0, "z": -3.095, "radius_m": 4.0},
+    {"kind": "gate", "x": -105.0, "y": 0.0, "z": -2.652, "radius_m": 4.0},
+    {"kind": "gate", "x": -135.0, "y": 0.0, "z": -2.261, "radius_m": 4.0},
+    {"kind": "gate", "x": -165.0, "y": 0.0, "z": -2.156, "radius_m": 4.0}
+  ]
+}

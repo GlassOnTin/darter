@@ -1,0 +1,100 @@
+{
+  "schema": "darter_areas",
+  "version": 1,
+  "attribution": "© OpenStreetMap contributors, ODbL 1.0 | © Copernicus DEM / ESA (GLO-30)",
+  "notes": "city/coast/hills OSM fetched 2026-10-03 through maps.mail.ru (overpass-api.de and other instances 406/504'd that day); coast origin nudged from Calshot Spit to the Stone shore (spit is unmapped); hills origin nudged 318 m S / 163 m E of Butser Hill so the 4530 m DEM grid stays inside tile N50_00_W001_00. suburb = the pre-existing home-area fixtures (OSM base 2026-06-01, DEM tile fetched 2026-10-01). Coast water renders as draped ground; sea water itself is a later rung.",
+  "areas": [
+    {
+      "name": "city",
+      "title": "City",
+      "description": "Southampton near Guildhall Square: dense blocks, streets, hedgerows. Street-canyon transit west at 14 m/s.",
+      "lat": 50.9060,
+      "lon": -1.4012,
+      "seed": 11,
+      "record_seed": 21,
+      "track": "track.json",
+      "inputs": {
+        "osm": "osm_city.json",
+        "osm_sha256": "84d5a655f5507e639dba5ab08cf8e7b110c238d3352d466622b1f6c146d170a8",
+        "dem": "dem_city.tif",
+        "dem_sha256": "44f286eba288248851253c760d463f90d4920b2164225b968105d333be7282d0",
+        "glo30_tile": "N50_00_W002_00",
+        "full_tile_sha256": "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134"
+      },
+      "counts": {"buildings": 1740, "roads": 1283, "strips": 85, "grass": 153, "trees": 1727},
+      "relief": {"z_min": -2.8, "z_max": 36.9},
+      "span_m": 2190.0,
+      "fetched": {"date": "2026-10-03", "endpoint": "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "radius_m": 600},
+      "record": {"seed": 21, "altitude_m": 30, "duration_s": 20, "max_crossing_s": 17.793}
+    },
+    {
+      "name": "suburb",
+      "title": "Suburb",
+      "description": "The home area: residential grid, hedges, scattered trees, playing fields. The corridor slalom.",
+      "lat": 50.8989,
+      "lon": -1.0586,
+      "seed": 5,
+      "record_seed": 7,
+      "track": "track.json",
+      "inputs": {
+        "osm": "osm_home_area.json",
+        "osm_sha256": "cb16d5f8f422fa4628c03572080f5c3358399b276ac384e47af9fd3d398686ae",
+        "dem": "dem_home_area.tif",
+        "dem_sha256": "b298b3a345cfc2c1462a751ecb429f34a2db21a1d0fccd080b6df509433b55cf",
+        "glo30_tile": "N50_00_W002_00",
+        "full_tile_sha256": "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134"
+      },
+      "counts": {"buildings": 1372, "roads": 330, "strips": 47, "grass": 12, "trees": 1069},
+      "relief": {"z_min": -20.5, "z_max": 74.2},
+      "span_m": 4740.0,
+      "fetched": {"date": null, "endpoint": null, "radius_m": null},
+      "record": {"seed": 7, "altitude_m": 35, "duration_s": 20, "max_crossing_s": 17.035}
+    },
+    {
+      "name": "coast",
+      "title": "Coast",
+      "description": "Stone sea front on Southampton Water: village, shingle, sea as draped ground this release.",
+      "lat": 50.8130,
+      "lon": -1.3070,
+      "seed": 13,
+      "record_seed": 23,
+      "track": "track.json",
+      "inputs": {
+        "osm": "osm_coast.json",
+        "osm_sha256": "21dfdcca691bfc102efb135427aff3fffa9aefcc97def1f215bc076534da469e",
+        "dem": "dem_coast.tif",
+        "dem_sha256": "84d3ce38735ea9b36ef1d9af374c0b500d422fa311f8e1aa6e6015e8dfa54168",
+        "glo30_tile": "N50_00_W002_00",
+        "full_tile_sha256": "e2d23f4652b1f2e3bf01a29e20ea315d728799db6519fe2c2f50aaf7c18f2134"
+      },
+      "counts": {"buildings": 162, "roads": 22, "strips": 1, "grass": 6, "trees": 412},
+      "relief": {"z_min": -1.7, "z_max": 16.6},
+      "span_m": 1950.0,
+      "fetched": {"date": "2026-10-03", "endpoint": "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "radius_m": 700},
+      "record": {"seed": 23, "altitude_m": 30, "duration_s": 20, "max_crossing_s": 17.805}
+    },
+    {
+      "name": "hills",
+      "title": "Hills",
+      "description": "South Downs near Butser Hill: open country, farmed slopes, steep relief. A level transit over the valley floor, about 60 m above the ground.",
+      "lat": 50.9761,
+      "lon": -0.9457,
+      "seed": 17,
+      "record_seed": 29,
+      "track": "track.json",
+      "inputs": {
+        "osm": "osm_hills.json",
+        "osm_sha256": "e226352c4583c938fb7345e0c377dd85646e399ccd6f9c22b474a891132bfb49",
+        "dem": "dem_hills.tif",
+        "dem_sha256": "870d4f9318b7047c11d2eabd246ae0c5dbb9e93c3012517bf75150e7af435884",
+        "glo30_tile": "N50_00_W001_00",
+        "full_tile_sha256": "09609412e26651cfdc4ccf0e336f66581f4af64145670a11aae13848c7429c6d"
+      },
+      "counts": {"buildings": 143, "roads": 101, "strips": 16, "grass": 9, "trees": 1503},
+      "relief": {"z_min": -94.2, "z_max": 124.9},
+      "span_m": 4530.0,
+      "fetched": {"date": "2026-10-03", "endpoint": "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "radius_m": 900},
+      "record": {"seed": 29, "altitude_m": 60, "duration_s": 20, "max_crossing_s": 17.826}
+    }
+  ]
+}

@@ -795,6 +795,152 @@ fn demo_area_fixtures_inputs() {
     }
 }
 
+// ---- S3: the committed areas index (tools/godot_smoke/areas/index.json) ----
+//
+// The payload layout under the same paths (areas/<name>) is asserted by T8's
+// bundle-vs-regen equality (tests/godot_pack.rs); this plain test owns the
+// committed-side identity: schema/order, attribution verbatim, per-area
+// input shas vs the fixture bytes, seeds vs the S1 pin table, and the four
+// track files' shape (6 gate rings, radius 4.0) — the deep darter_track
+// parse itself lives in sim_run and is exercised by T8 slice (b) per area.
+
+const AREAS_INDEX: &str = "tools/godot_smoke/areas/index.json";
+const TRACK_DIR: &str = "tools/godot_smoke/track";
+const ATTRIBUTION: &str =
+    "© OpenStreetMap contributors, ODbL 1.0 | © Copernicus DEM / ESA (GLO-30)";
+
+const AREA_ORDER: [&str; 4] = ["city", "suburb", "coast", "hills"];
+const RECORD_SEEDS: [(&str, u64); 4] =
+    [("city", 21), ("suburb", 7), ("coast", 23), ("hills", 29)];
+const MAX_CROSSINGS: [(&str, f64); 4] =
+    [("city", 17.793), ("suburb", 17.035), ("coast", 17.805), ("hills", 17.826)];
+
+#[test]
+fn demo_areas_index_commit() {
+    let text = std::fs::read_to_string(AREAS_INDEX)
+        .expect("read areas index.json (S3)");
+    let idx: serde_json::Value = serde_json::from_str(&text).expect("index.json parse");
+
+    assert_eq!(
+        idx.get("schema").and_then(|v| v.as_str()),
+        Some("darter_areas"),
+        "index schema"
+    );
+    assert!(idx.get("version").and_then(|v| v.as_i64()) == Some(1), "index version 1");
+    assert_eq!(
+        idx.get("attribution").and_then(|v| v.as_str()),
+        Some(ATTRIBUTION),
+        "attribution must be the verbatim ODbL + Copernicus credit"
+    );
+
+    let areas = idx
+        .get("areas")
+        .and_then(|v| v.as_array())
+        .expect("areas array");
+    assert_eq!(areas.len(), 4, "four demo areas (city, suburb, coast, hills)");
+
+    for (row, want_name) in areas.iter().zip(AREA_ORDER.iter()) {
+        assert_eq!(
+            row.get("name").and_then(|v| v.as_str()),
+            Some(*want_name),
+            "area order: index must match the AREAS table (city, suburb, coast, hills)"
+        );
+
+        // track ref: uniform area-local name, source file parses as a
+        // darter_track v1 gate ring stack
+        let track_ref = row
+            .get("track")
+            .and_then(|v| v.as_str())
+            .expect("track ref");
+        assert_eq!(track_ref, "track.json", "{want_name}: bundle-local track ref");
+        // the corridor's source track keeps its historical file name; the
+        // three new areas live next to it as <name>.json — both bundle to
+        // areas/<name>/track.json (T8's (e) equality covers the copy)
+        let track_src = if *want_name == "suburb" { "demo_track.json" } else { &format!("{want_name}.json") };
+        let track_path = format!("{TRACK_DIR}/{track_src}");
+        let track_text = std::fs::read_to_string(&track_path)
+            .unwrap_or_else(|e| panic!("read {track_path}: {e}"));
+        let track: serde_json::Value =
+            serde_json::from_str(&track_text).expect("track.json parse");
+        assert_eq!(
+            track.get("schema").and_then(|v| v.as_str()),
+            Some("darter_track"),
+            "{track_path}: schema"
+        );
+        assert!(track.get("version").and_then(|v| v.as_i64()) == Some(1));
+        let cps = track
+            .get("checkpoints")
+            .and_then(|v| v.as_array())
+            .expect("checkpoints array");
+        assert_eq!(cps.len(), 6, "{track_path}: 6 checkpoints");
+        for cp in cps.iter() {
+            assert_eq!(cp.get("kind").and_then(|v| v.as_str()), Some("gate"));
+            assert!(cp.get("radius_m").and_then(|v| v.as_f64()) == Some(4.0));
+            assert!(cp.get("x").and_then(|v| v.as_f64()).is_some());
+            assert!(cp.get("y").and_then(|v| v.as_f64()).is_some());
+            assert!(cp.get("z").and_then(|v| v.as_f64()).is_some());
+        }
+        assert!(track.get("spawn").and_then(|v| v.get("x")).and_then(|v| v.as_f64()).is_some());
+
+        // inputs vs the committed fixture bytes
+        let inputs = row.get("inputs").expect("inputs block");
+        let osm_name = inputs.get("osm").and_then(|v| v.as_str()).expect("osm input name");
+        let osm_bytes = std::fs::read(format!("tests/fixtures/{osm_name}")).expect("osm fixture");
+        let osm_sha = {
+            let mut h = darter_core::sha256::Sha256::new();
+            h.update(&osm_bytes);
+            darter_core::sha256::to_hex(&h.finish())
+        };
+        assert_eq!(
+            inputs.get("osm_sha256").and_then(|v| v.as_str()),
+            Some(osm_sha.as_str()),
+            "{want_name}: osm sha vs {osm_name} bytes"
+        );
+        let dem_name = inputs.get("dem").and_then(|v| v.as_str()).expect("dem input name");
+        let dem_bytes = std::fs::read(format!("tests/fixtures/{dem_name}")).expect("dem fixture");
+        let dem_sha = {
+            let mut h = darter_core::sha256::Sha256::new();
+            h.update(&dem_bytes);
+            darter_core::sha256::to_hex(&h.finish())
+        };
+        assert_eq!(
+            inputs.get("dem_sha256").and_then(|v| v.as_str()),
+            Some(dem_sha.as_str()),
+            "{want_name}: dem sha vs {dem_name} bytes"
+        );
+
+        // seeds + origin vs the pin table (DEMO_AREAS for the three new
+        // areas, the home constants for suburb)
+        let lat = row.get("lat").and_then(|v| v.as_f64()).expect("lat");
+        let lon = row.get("lon").and_then(|v| v.as_f64()).expect("lon");
+        let seed = row.get("seed").and_then(|v| v.as_i64()).expect("seed");
+        let rseed = row
+            .get("record_seed")
+            .and_then(|v| v.as_i64())
+            .expect("record_seed");
+        assert_eq!(rseed as u64, RECORD_SEEDS.iter().find(|(n, _)| *n == *want_name).expect("record seed pin").1);
+        if *want_name == "suburb" {
+            assert!((lat - HOME_LAT).abs() < 1e-9);
+            assert!((lon - HOME_LON).abs() < 1e-9);
+            assert_eq!(seed as u64, SEED);
+        } else {
+            let pin = DEMO_AREAS.iter().find(|a| a.name == *want_name).expect("pin");
+            assert!((lat - pin.lat).abs() < 1e-9, "{want_name}: lat");
+            assert!((lon - pin.lon).abs() < 1e-9, "{want_name}: lon");
+            assert_eq!(seed as u64, pin.seed, "{want_name}: pack seed");
+        }
+
+        // measured crossings stay inside the replay window (T8 gates < 19 s)
+        let crossing = row
+            .get("record")
+            .and_then(|v| v.get("max_crossing_s"))
+            .and_then(|v| v.as_f64())
+            .expect("record max_crossing_s");
+        assert_eq!(crossing, MAX_CROSSINGS.iter().find(|(n, _)| *n == *want_name).expect("crossing pin").1);
+        assert!(crossing <= 19.0, "{want_name}: crossing {crossing} beyond 19 s");
+    }
+}
+
 /// loose — remote content is not pinned — but the fetch must produce a
 /// pack that validates, with the fetch date and endpoint recorded.
 #[test]

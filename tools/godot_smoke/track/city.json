@@ -1,0 +1,14 @@
+{
+  "schema": "darter_track",
+  "version": 1,
+  "name": "city_canyon_transit",
+  "spawn": {"x": 0.0, "y": 0.0, "z": 45.300},
+  "checkpoints": [
+    {"kind": "gate", "x": -15.0, "y": 0.0, "z": 44.605, "radius_m": 4.0},
+    {"kind": "gate", "x": -45.0, "y": 0.0, "z": 43.515, "radius_m": 4.0},
+    {"kind": "gate", "x": -75.0, "y": 0.0, "z": 42.974, "radius_m": 4.0},
+    {"kind": "gate", "x": -105.0, "y": 0.0, "z": 42.933, "radius_m": 4.0},
+    {"kind": "gate", "x": -135.0, "y": 0.0, "z": 43.003, "radius_m": 4.0},
+    {"kind": "gate", "x": -165.0, "y": 0.0, "z": 42.612, "radius_m": 4.0}
+  ]
+}

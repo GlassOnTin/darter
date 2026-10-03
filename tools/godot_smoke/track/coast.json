@@ -1,0 +1,14 @@
+{
+  "schema": "darter_track",
+  "version": 1,
+  "name": "coast_shoreline_transit",
+  "spawn": {"x": 0.0, "y": 0.0, "z": 30.000},
+  "checkpoints": [
+    {"kind": "gate", "x": -15.0, "y": 0.0, "z": 29.312, "radius_m": 4.0},
+    {"kind": "gate", "x": -45.0, "y": 0.0, "z": 28.301, "radius_m": 4.0},
+    {"kind": "gate", "x": -75.0, "y": 0.0, "z": 27.953, "radius_m": 4.0},
+    {"kind": "gate", "x": -105.0, "y": 0.0, "z": 28.142, "radius_m": 4.0},
+    {"kind": "gate", "x": -135.0, "y": 0.0, "z": 28.338, "radius_m": 4.0},
+    {"kind": "gate", "x": -165.0, "y": 0.0, "z": 28.168, "radius_m": 4.0}
+  ]
+}
