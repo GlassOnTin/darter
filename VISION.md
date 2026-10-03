@@ -11,6 +11,13 @@ A free-software drone flight simulator that runs real flight controller firmware
 OpenStreetMap, on Android and desktop, with no ads, no trackers, and no paid
 unlocks.
 
+The motivation is to make this a virtual hardware test platform. The flight
+controller is flown against the simulator rather than reimplemented inside it:
+either the real firmware runs as an emulated SITL build, or an honest model of
+flight-controller behaviour stands in where a SITL build is impractical.
+Tuning, configuration and fault-recovery checks then happen in the simulator,
+against real terrain, before anything flies for real.
+
 Each ingredient exists somewhere on its own. Closed sims (Liftoff, Velocidrone,
 Uncrashed) have polish but approximate the flight stack, ship baked scenery, and
 several carry ads or subscriptions. Research projects (Flightmare,
