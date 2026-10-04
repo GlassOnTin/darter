@@ -690,7 +690,9 @@ Measured, Estimated, and Derived, upgradeable in place by measured data.
   `tests/wind.rs`, closed-loop yaw residual in `tests/sitl_loop.rs`.
 - The on-device instruments: `tools/godot_smoke/android/musend.c` (the
   loopback-UDP variant matrix), the C3 recipe + gates in
-  `tools/godot_smoke/export_presets.cfg`.
+  `tools/godot_smoke/export_presets.cfg`, the C4 free-fly probe with its
+  recipe/gates in the same file, and the C4 flight analysis in
+  `docs/physics.md` §17.
 
 ## 16. On-device form: the C3 no-UDP cause and the mid-air disarm (M2d)
 
@@ -815,3 +817,112 @@ aux input. Its Android slot map differs from the desktop evdev map on
 slots 2/3/4; both tables are documented in `tools/gdext/src/lib.rs`
 (`pocket_input`). When the radio is attached during a probe flight it
 must not be touched: real stick moves override the injections.
+## 17. On-device form: the real-radio five-minute flow and the FC-clock freeze (M2d C4/C5)
+
+`tools/godot_smoke/fly_free_android.gd` / `.tscn` are the C4 free-fly
+probe: a REAL pilot (the physical RadioMaster Pocket over OTG) flies the
+packaged SITL with nothing synthetic injected. Differences from the C3
+probe: the pump is CHUNKED per physics frame (wall delta x 250 Hz,
+clamped 1..12 ticks) so the Android input stack gets frame boundaries to
+flush the kernel HID events through — the single blocking pump(50) loop
+of the C3 probe starved them; and an on-screen status Label exists
+(grey-screen mitigation level 1; the scenery render is M2e). Choreography
+is in the probe header. The rung artifact is `darter-free.apk`
+(sha256 `a9c94f38f13ad382f0884dbad43f38c94c26d6c2d89d14b06ead0b32c9ac4237`
+on the S8-recorded pass); recipe in the C4 block of
+`tools/godot_smoke/export_presets.cfg`.
+
+**The five-minute flow, measured (the pilot's own first flight, CPH2655):**
+
+- The real pad enumerates: `pads=1`, name "EdgeTX Radiomaster Pocket
+  Joystick", guid `45646765545820526164696f6d617374` (the M2d guid).
+  Kernel `event12` HID streamed into the chunked pump: `input_seen
+  slot=2` at wall 4.4 s after boot (raw change -0.608 on the throttle
+  slot). Arm first try, `armed_at` 11.87 sim s.
+- Epochs: install 1791120693.209 (adb install return), boot
+  1791121333.383, `climbing` 1791121349.445. Launch->climbing =
+  **16.06 wall s**. Install->climbing = 656.24 s, of which ~640 s was
+  the pilot setting the radio up before the app was launched (not
+  verified what — the product's leg is the 16.06 s).
+- The record finished: 45000/45000 ticks, hash `07a8c9671236d81c`,
+  header `"input":"pocket_hid"`, embedded SITL sha = the PACKAGED
+  `1ddb7022…` (the AGP-strip pair from §16 holds).
+- Pacing: ~0.96x sim/wall while the pilot idled and wiggled, 0.83x
+  end-to-end (216.7 wall s for 180 sim s; one throttled window drags
+  it, below). The chunked pump beats the C3 blocking legs' ~0.58x.
+
+**The reported anomaly (the pilot cut throttle, altitude kept rising)
+is real and is the C3 starvation family, at human scale:**
+
+- Stick trace (fly.log, wall-stamped): full throttle 15.56-16.52, 0.90
+  at 17.00, 0.43 at 17.48, **0.01 from 19.40 onward** (raw ax2 pinned
+  -0.984, aux3 2000 to the end). The motors ignored it: record rows at
+  t=30 show r0 ~26000 rpm, i0 20.4 A, and the quad climbed +204 m to a
+  292.319 m crest (t=35.424, vz +0.010 at crest). Motors zero from
+  t~35.6 (r0 9625 -> 15477 spike -> 4226 -> 0 across 34.64-35.64), then
+  a 292 m ballistic fall (vz to -39.06), ground ~t=49.5, and the flight
+  rested with the label frozen (armed_at is first-arm only; max_alt is
+  a running max — see the label limits below).
+- FC console (`sitl_stdout.log`, the SITL's own clock): takeoff record
+  t=15.08 / SITL 17.9 (clock offset +2.8 s); the SITL trace shows the
+  climb still POWERED through the cut — spd accelerating 5.50 -> 21.39
+  m/s and alt 167 -> 289 m over SITL 35.6-51.6, i.e. after the pilot
+  had stick at 0.01; crest at record 35.42 / SITL ~52 (offset +16.5 s).
+- Two independent instruments show the FC clock diverging through the
+  window: the SITL's own position rows and the pump's `servo_packets`
+  (9002 drain count): servos-per-sample 1.61 (idle), 2.26 (armed
+  climb), **3.63 (starve window)**, 1.59 (post-land) — the FC clock
+  charged ~3.6x the sim clock exactly while the stick sat at zero.
+- The SITL mainloop's own dump gap measures one lump directly: between
+  consecutive periodic dumps, SITL t jumped **51.6 -> 105.4 s** (one
+  53.8 FC-s gap) — the pass during which the parked failsafe chain
+  collapsed.
+- Banner sequence (the FC console's only event lines in the sealed
+  build): the first mid-flight `Arming disabled` banner at SITL 105.4
+  reads `ANGLE ARM_SWITCH` with NO RXLOSS — the FC was already disarmed
+  and tumbling by then; `RXLOSS` only appears at SITL 136.5 (after
+  impact) and is gone by 137.5, leaving `NOT_DISARMED ARM_SWITCH` —
+  the rx-recovered flavor (§16's 0x4), arriving AFTER the disarm, and
+  it explains why the pilot's late stick moves (commanded 0.35-0.42 at
+  record ~69-72) spun no motors: the FC latched with the arm switch
+  still high.
+
+**Mechanism (measured facts above; the staging is the consistent
+reading, not captured frame-by-frame):** the pump->FC rc leg stalled
+near the stick cut. The SITL's `micros64` advances only on calls, so a
+leg as dead as this one freezes the FC clock: the failsafe delay
+(failsafe_delay 15 = 1.5 FC s) never elapses and stage-1 holds the LAST
+received frames — full throttle from the climb. The FC therefore flew
+ARMED on stale full-throttle RC for ~15.5 record-s (+204 m). When a
+burst finally drained, one mainloop pass lump-charged 53.8 FC-s, the
+whole RXLOSS -> stage 1 -> stage 2 DROP_IT chain collapsed at once, and
+the disarm happened at record ~35.0-35.6 — 15.5 record-s after the cut,
+1.5 FC-s in the FC's own accounting. The later RXLOSS latch -> trickle
+-> recovery on the ground matches §16's flavor-0x4.
+
+Not verified: the per-leg delivery timing (no counters in the sealed
+build; send-side pump stall vs receive-side SITL thread stall — the
+§16 discriminator exists if ever needed), and the exact BF stage
+transitions inside the lump (the banner sequence constrains them).
+The 29.12 wall-s gap between two fly.log diag rows at record 35.5-35.9
+was the app's physics loop throttled to ~0.8 fps (the pump kept its
+legs: servos +122 at ~1/tick through the gap) — pilot-side app
+throttling, NOT the UDP starvation; don't confuse the two in future
+reads. App survived the run backgrounded; the M1 OEM kill rule did not
+reproduce.
+
+**C5 rung founded by this flight (fix rung, success test first):** a
+real-pilot flight where a mid-flight stick cut reaches the motors
+within ~2 s and the failsafe disarms within ~2 s of the cut — no
+sustained climb on stale throttle. Instruments: the diag (DARTER-DIAG)
+SITL .so swapped into the C4 staging for the disarm reason/millis/flags,
+plus gdext pump counters (rc-sent/s, fdm-recv/s) per phase. Fix lever
+per the evidence: the hook holds your values fine — the delivery and
+clock leg inside the app/loop is what starves, so the fix lives in the
+pump/loop, not the radio.
+
+**Label limits (known, to fix with the state dict):** the on-screen
+label shows `max_alt` (a running maximum — it froze at 292.3 m during
+the fall, reading like "still high") and `armed=first-arm time` only —
+it cannot show a later disarm. The state dict has no current altitude
+or live armed bit; expose both (`pocket z`, `armed_now`) when touched.
