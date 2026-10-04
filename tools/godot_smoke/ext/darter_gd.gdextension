@@ -3,8 +3,15 @@
 ; tools/gdext, which holds the Rust source and the version pin).
 ;
 ; M2a rung: exposes the DarterQuad class (the darter-core flight loop) to
-; the Godot project. Only the desktop target is populated for parity
-; testing; android.arm64 lands with the on-device rungs (M2b+).
+; the Godot project. The desktop target is used for parity testing; M2d
+; adds the android.arm64 entry for the on-device SITL probe.
+;
+; Naming: the gdext cdylib builds as `libdarter_gd.so` on BOTH targets, so
+; the host copy is staged under a distinct name (`_host`) and the android
+; copy takes the plain name — both siblings can sit in ext/ while the
+; Android export packs only the android one (Godot skips .so files the
+; descriptor does not list for the target platform; measured in the M2d
+; APK, 2026-10-04).
 
 [configuration]
 
@@ -13,4 +20,5 @@ compatibility_minimum = "4.7"
 
 [libraries]
 
-linux.x86_64 = "res://ext/libdarter_gd.so"
+linux.x86_64 = "res://ext/libdarter_gd_host.so"
+android.arm64 = "res://ext/libdarter_gd.so"

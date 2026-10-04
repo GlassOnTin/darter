@@ -27,6 +27,7 @@ use darter_core::sensor::SensorConfig;
 use darter_core::terrain::TerrainGrid;
 use darter_core::DVec3;
 use godot::global::JoyAxis;
+use std::process::{Command, Stdio};
 use godot::prelude::*;
 
 /// The extension entry struct (gdext wants a named unit type; the class
@@ -270,6 +271,60 @@ impl IRefCounted for DarterFlyer {
 
 #[godot_api]
 impl DarterFlyer {
+    /// Absolute path of the packaged Betaflight SITL inside this
+    /// extension's own native-library directory — the one executable
+    /// location an Android app owns (the SITL ships as `libbetaflight_sitl.so`,
+    /// a jniLib; app-data exec is denied on Android 10+). Resolved from
+    /// dladdr of this extension's own load address: `dli_fname` is the
+    /// path the dynamic linker actually used. Empty string when dladdr
+    /// cannot resolve this library (or the sibling is absent) — e.g. the
+    /// desktop CI probe, which passes its explicit binary path instead and
+    /// never calls this.
+    #[func]
+    fn flyer_sitl_path(&mut self) -> GString {
+        fn flyer_sitl_anchor() {} // an address inside this cdylib's text
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        let resolved =
+            unsafe { libc::dladdr(flyer_sitl_anchor as *const libc::c_void, &mut info) } != 0;
+        // dli_fname is only meaningful when dladdr succeeded — on failure
+        // the struct is zeroed and the name pointer is null.
+        let dir = resolved
+            .then(|| unsafe {
+                std::ffi::CStr::from_ptr(info.dli_fname).to_string_lossy().into_owned()
+            })
+            .and_then(|s| std::path::Path::new(&s).parent().map(|d| d.to_path_buf()));
+        let path = dir.map(|d| d.join("libbetaflight_sitl.so"));
+        match path {
+            Some(p) if p.is_file() => GString::from(p.to_string_lossy().as_ref()),
+            _ => GString::new(),
+        }
+    }
+
+    /// Cheap spawn sanity check: run the `libmusend.so` sibling (a tiny
+    /// loopback-UDP send, the C3 no-flight instrument kept as a smoke test)
+    /// from the same directory and process context as the SITL child. If
+    /// exec or loopback UDP is broken this names it before a flight is
+    /// attempted. Godot's own OS.execute hangs the main thread on Android
+    /// (grey screen), so the spawn goes through the same Command machinery
+    /// that launches the SITL; returns the child's stderr lines.
+    #[func]
+    fn flyer_musend(&mut self, musend_bin: GString) -> PackedStringArray {
+        let mut out = PackedStringArray::new();
+        let exec = Command::new(musend_bin.to_string())
+            .stderr(Stdio::piped())
+            .output();
+        match exec {
+            Ok(o) => {
+                out.push(&format!("exit={:?}", o.status.code().unwrap_or(-999)));
+                for line in String::from_utf8_lossy(&o.stderr).lines() {
+                    out.push(line);
+                }
+            }
+            Err(e) => out.push(&format!("spawn: {e}")),
+        }
+        out
+    }
+
     /// Spawn the SITL child, apply + diff-verify the profile, open the
     /// record, arm. Returns the empty string on success, else the failure
     /// text — errors cannot panic across the FFI boundary. `profile` "" =
@@ -419,7 +474,21 @@ impl DarterFlyer {
                 d.set("ticks_done", s.ticks_done as i64);
                 d.set("ticks_total", s.ticks_total as i64);
                 d.set("max_alt", s.max_alt);
+                d.set("servo_packets", s.servo_packets as i64);
             }
+        }
+        // Hook diagnostic (PocketDebug): the newest live-input sample and
+        // its raw device-0 slot reads. Meaningful only while the pocket
+        // hook is set; process-global, so it reports even between pumps.
+        if let Ok(dbg) = POCKET_DEBUG.lock() {
+            let pocket_raw = to_godot_packed(&dbg.raw);
+            d.set("pocket_raw", &pocket_raw);
+            d.set("pocket_throttle", dbg.throttle);
+            d.set("pocket_aux3_us", dbg.aux3_us as i64);
+            d.set("pocket_yaw", dbg.yaw);
+            d.set("pocket_pitch", dbg.pitch);
+            d.set("pocket_roll", dbg.roll);
+            d.set("pocket_samples", dbg.samples as i64);
         }
         d
     }
@@ -450,25 +519,64 @@ fn to_godot_packed(v: &[f64]) -> PackedFloat32Array {
     PackedFloat32Array::from(v.iter().map(|x| *x as f32).collect::<Vec<f32>>())
 }
 
+/// Last `pocket_input` sample, for the state-dict diagnostic. The hook runs
+/// once per pumped tick; `flyer_state_dict` exposes the stash as
+/// pocket_raw/pocket_throttle/pocket_aux3_us/pocket_yaw/pocket_pitch/
+/// pocket_roll/pocket_samples — the measurement that separates "the hook
+/// never saw the synthetic inputs" from "the servo leg never answered".
+#[derive(Clone, Copy)]
+struct PocketDebug {
+    raw: [f64; 8],
+    throttle: f64,
+    aux3_us: u16,
+    yaw: f64,
+    pitch: f64,
+    roll: f64,
+    samples: u64,
+}
+
+impl PocketDebug {
+    const EMPTY: Self = Self {
+        raw: [0.0; 8],
+        throttle: 0.0,
+        aux3_us: 0,
+        yaw: 0.0,
+        pitch: 0.0,
+        roll: 0.0,
+        samples: 0,
+    };
+}
+
+static POCKET_DEBUG: std::sync::Mutex<PocketDebug> =
+    std::sync::Mutex::new(PocketDebug::EMPTY);
+
 /// One tick of the RadioMaster Pocket HID mapping, read live from Godot's
 /// Input singleton. Measured against the physical radio over USB (guided
-/// captures, 2026-10-04, eight rounds; scratch logs not committed). The
+/// single-control captures, 2026-10-04; scratch logs not committed). The
 /// axis slots below are Input.get_joy_axis indexes for this device — Godot
 /// passes raw HID report slots through unremapped, so they are NOT the
-/// standard controller semantics (the right stick is slots 0/1, the left
-/// stick LR is slot 2; there is no LEFT_Y on this device):
+/// standard controller semantics. The right stick is slots 0 (LR) / 1 (UD)
+/// and SB sits on slot 5 on every platform measured, but the left-stick
+/// and SA slots PERMUTE — the desktop evdev path and the Android input
+/// stack sort the same raw HID axes differently:
 ///
-///   slot 0  right-stick LR   -1 left .. +1 right   (aileron -> roll)
-///   slot 1  right-stick UD   +1 = stick away       (elevator -> pitch)
-///   slot 2  left-stick  LR   -1 left .. +1 right   (rudder -> yaw)
-///   slot 3  SA switch        -1 / 0 / +1; +1 = arm end (-> aux3 2000 us)
-///   slot 4  throttle         0 at bottom .. +1 at top
-///   slot 5  SB switch        -1 / 0 / +1
+///   desktop Linux (evdev):
+///     slot 2  left-stick  LR   -1 left .. +1 right   (rudder -> yaw)
+///     slot 3  SA switch        -1 / 0 / +1; +1 = arm end (-> aux3 2000 us)
+///     slot 4  throttle         0 at bottom .. +1 at top
+///   Android (kernel ABS -> classic-joypad slots):
+///     slot 2  left-stick  UD   -1 bottom .. +1 top    (throttle, no spring)
+///     slot 3  left-stick  LR   -1 left .. +1 right   (rudder -> yaw)
+///     slot 4  SA switch        -1 (down) / +1 (up) = arm end (-> aux3)
 ///
-/// SC (3-pos) and the SF trim dial are HID-silent; SD = button 1; SE, the
-/// only push button, = button 0 — none of these feed the RC path. The
-/// same facts are in tests/godot_flyer.rs's pocket test (the mapping's
-/// acceptance test) and docs/physics.md section 11.
+/// SC (3-pos) and the SF trim dial are HID-silent on BOTH platforms; SD =
+/// button 1; SE, the only push button, = button 0 — none of these feed the
+/// RC path. On Android a 3-position switch reads -1 / ~0 / +1 across an
+/// -1..+1 span (its "0" measured ~0.0005, one raw count off mid), and the
+/// throttle's bottom rests near -1, not 0 — the Android span is remapped
+/// to 0..1 below. The desktop facts are in tests/godot_flyer.rs's pocket
+/// test (the mapping's acceptance test) and docs/physics.md section 11;
+/// the Android facts are gated by the on-device M2d probe rung.
 fn pocket_input() -> LiveInput {
     let input = godot::classes::Input::singleton();
     // Device 0, read unconditionally — NOT gated on get_connected_joypads.
@@ -482,15 +590,48 @@ fn pocket_input() -> LiveInput {
     let slot =
         |n: i64| -> JoyAxis { JoyAxis::try_from_ord(n as i32).unwrap_or(JoyAxis::INVALID) };
     let ax = |n: i64| -> f64 { input.get_joy_axis(0, slot(n)) as f64 };
-    let sa = ax(3); // -1 / 0 / +1; the +1 end is arm
-    let aux3_us = (1500.0_f64 + sa * 500.0).clamp(1000.0, 2000.0) as u16;
-    LiveInput {
-        roll: ax(0),
-        pitch: ax(1),
-        yaw: ax(2),
-        // Measured range: slot 4 sits at 0 at the throttle's bottom, +1 at
-        // the top — not the +-1 span the sticks swing.
-        throttle: ax(4).clamp(0.0, 1.0),
-        aux3_us,
+    // Raw slot reads (device-0 table) for the PocketDebug stash.
+    let raw: [f64; 8] = std::array::from_fn(|i| ax(i as i64));
+
+    #[cfg(target_os = "android")]
+    let out = {
+        // Android table: throttle on slot 2 spans -1 (bottom) .. +1 (top)
+        // across the raw 0..2047 range, so remap to the 0..1 stick scale;
+        // SA is slot 4, yaw (left-stick LR) slot 3.
+        let throttle = ((ax(2) + 1.0) / 2.0).clamp(0.0, 1.0);
+        let sa = ax(4); // -1 down / +1 up; the +1 end is arm
+        let aux3_us = (1500.0_f64 + sa * 500.0).clamp(1000.0, 2000.0) as u16;
+        LiveInput {
+            roll: ax(0),
+            pitch: ax(1),
+            yaw: ax(3),
+            throttle,
+            aux3_us,
+        }
+    };
+    #[cfg(not(target_os = "android"))]
+    let out = {
+        let sa = ax(3); // -1 / 0 / +1; the +1 end is arm
+        let aux3_us = (1500.0_f64 + sa * 500.0).clamp(1000.0, 2000.0) as u16;
+        LiveInput {
+            roll: ax(0),
+            pitch: ax(1),
+            yaw: ax(2),
+            // Measured range: slot 4 sits at 0 at the throttle's bottom, +1
+            // at the top — not the +-1 span the sticks swing.
+            throttle: ax(4).clamp(0.0, 1.0),
+            aux3_us,
+        }
+    };
+
+    if let Ok(mut dbg) = POCKET_DEBUG.lock() {
+        dbg.raw = raw;
+        dbg.throttle = out.throttle;
+        dbg.aux3_us = out.aux3_us;
+        dbg.yaw = out.yaw;
+        dbg.pitch = out.pitch;
+        dbg.roll = out.roll;
+        dbg.samples += 1;
     }
+    out
 }

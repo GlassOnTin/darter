@@ -52,9 +52,11 @@ func _ready() -> void:
 	var work := OS.get_environment("DARTER_FLYER_WORK")
 	if work.is_empty():
 		_fail("DARTER_FLYER_WORK unset")
+		return
 	var bin := OS.get_environment("DARTER_FLYER_BIN")
 	if bin.is_empty():
 		_fail("DARTER_FLYER_BIN unset")
+		return
 
 	var flyer: DarterFlyer = DarterFlyer.new()
 	var sensors := OS.get_environment("DARTER_FLYER_SENSORS")
@@ -70,12 +72,14 @@ func _ready() -> void:
 			OS.get_environment("DARTER_FLYER_PROFILE"))
 	if err != "":
 		_fail("flyer_start: %s" % err)
+		return
 
 	var last_ax := {}
 	while true:
 		var e: String = flyer.flyer_pump(50)
 		if e != "":
 			_fail("flyer_pump: %s" % e)
+			return
 		var pd: Dictionary = flyer.flyer_state_dict()
 		if radio_on:
 			_pilot(pd, last_ax)
@@ -86,6 +90,7 @@ func _ready() -> void:
 	var hashv: String = flyer.flyer_finish()
 	if hashv.length() != 16:
 		_fail("flyer_finish returned %s" % hashv)
+		return
 	print("FLYER hash=%s ticks=%d armed_at=%s max_alt=%s" % [
 		hashv, st["ticks_done"], st["armed_at"], str(st["max_alt"])
 	])

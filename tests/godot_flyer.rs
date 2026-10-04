@@ -54,7 +54,9 @@ use std::time::{Duration, Instant};
 const GODOT_SHA256: &str = "8d106cbe6144c2dc7e881d61d2429c1a8a76e6b22ef48bd5e48dcf934953f71e";
 
 const PROJECT: &str = "tools/godot_smoke";
-const EXT_DEST: &str = "tools/godot_smoke/ext/libdarter_gd.so";
+// Desktop arm of ext/darter_gd.gdextension (the android arm64 cdylib,
+// same cargo output name, owns the plain `libdarter_gd.so` sibling).
+const EXT_DEST: &str = "tools/godot_smoke/ext/libdarter_gd_host.so";
 
 /// Wall-clock cap on one probe process. The flight itself is ~13 s
 /// wall-paced plus SITL spawn and godot boot; anything well past that means

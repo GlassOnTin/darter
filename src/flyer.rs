@@ -25,8 +25,9 @@
 //!   timeline: hold the arm box DOWN until arming_disable clears (the FC
 //!   blocks arming for pwr_on_arm_grace = 5 s after boot; holding the box
 //!   active during any disable flag latches ARMING_DISABLED_ARM_SWITCH,
-//!   observed), raise the box, wait for ARM box + flags clear, then ramp
-//!   throttle (default 0.16, near hover) over 0.5 s.
+//!   observed; the latch clears once the box goes down again, it is not
+//!   power-cycle sticky), raise the box, wait for ARM box + flags clear,
+//!   then ramp throttle (default 0.16, near hover) over 0.5 s.
 //!
 //! NOT reproducible: the SITL's own PID loop runs on wall-clock time, so its
 //! dt carries UDP jitter and identical seeds vary run-to-run (section 11 of
@@ -191,6 +192,10 @@ pub struct FlyerSnapshot {
     pub ticks_total: usize,
     pub armed_at: Option<f64>,
     pub max_alt: f64,
+    /// Servo (motor-output) packets drained from the 9002 socket so far —
+    /// zero while every FC status looks fine means the SITL's servo leg is
+    /// broken, not the RC or fdm legs.
+    pub servo_packets: u64,
 }
 
 /// What finish() measured and produced. sim_run maps this field-for-field
@@ -737,6 +742,7 @@ impl Flyer {
             ticks_total: self.ticks_total,
             armed_at: self.armed_at,
             max_alt: self.max_alt,
+            servo_packets: self.servo_packets,
         }
     }
 

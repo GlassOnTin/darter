@@ -55,8 +55,11 @@ const GODOT_SHA256: &str = "8d106cbe6144c2dc7e881d61d2429c1a8a76e6b22ef48bd5e48d
 
 const PROJECT: &str = "tools/godot_smoke";
 /// The extension library path the committed
-/// tools/godot_smoke/ext/darter_gd.gdextension entry points at.
-const EXT_DEST: &str = "tools/godot_smoke/ext/libdarter_gd.so";
+/// tools/godot_smoke/ext/darter_gd.gdextension desktop entry points at.
+/// The host cdylib stages under the `_host` name because the android arm64
+/// cdylib (same cargo output name) claims `libdarter_gd.so` — both siblings
+/// share ext/ for the on-device Android export.
+const EXT_DEST: &str = "tools/godot_smoke/ext/libdarter_gd_host.so";
 
 fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("darter-godot-live-{name}-{}", std::process::id()));

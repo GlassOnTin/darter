@@ -15,5 +15,6 @@ __pycache__/
 # points here, but the .so is built from tools/gdext (cargo) and staged
 # by tests/godot_live.rs / the CI build step — same tier as /target
 /tools/godot_smoke/ext/libdarter_gd.so
+/tools/godot_smoke/ext/libdarter_gd_host.so
 /tools/gdext/target/
 /tools/elevation_cache/

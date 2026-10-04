@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "darter-core",
  "godot",
+ "libc",
 ]
 
 [[package]]

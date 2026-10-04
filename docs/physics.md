@@ -688,3 +688,130 @@ Measured, Estimated, and Derived, upgradeable in place by measured data.
 - The calibration report: `tests/calibration.rs`.
 - The physics gates: `tests/physics.rs`, wind spectrum check in
   `tests/wind.rs`, closed-loop yaw residual in `tests/sitl_loop.rs`.
+- The on-device instruments: `tools/godot_smoke/android/musend.c` (the
+  loopback-UDP variant matrix), the C3 recipe + gates in
+  `tools/godot_smoke/export_presets.cfg`.
+
+## 16. On-device form: the C3 no-UDP cause and the mid-air disarm (M2d)
+
+Measured on the OPPO CPH2655 (Adreno 830, Android 16) 2026-10-04, the
+exported Godot app flying the packaged Betaflight 2026.12.0-alpha SITL as
+a real child process. Assembly recipe and gates live in
+`tools/godot_smoke/export_presets.cfg`. Probe output is file-first
+(`user://fly.log`, `user://flyprobe/<run>/flight.jsonl`) because the OEM
+kills the app the moment it is backgrounded.
+
+**The exec and loading rules (measured):**
+
+- App-data exec is denied on Android 10+: the SITL ships as a jniLib
+  (`libbetaflight_sitl.so`) and spawns from nativeLibraryDir.
+- The packaged .so must stay extractable: when they live inside the APK,
+  nativeLibraryDir is empty and both the SITL spawn and gdext loading
+  die (`gradle_build/compress_native_libraries=true` in the preset, kept
+  for this reason).
+- gdext resolves the SITL sibling itself via `dladdr`: `flyer_sitl_path()`
+  takes the extension's own load address (`dli_fname`) and looks for
+  `libbetaflight_sitl.so` next to it. `OS.execute` hangs the Godot main
+  thread on Android, so children spawn through `std::process::Command`
+  inside the extension.
+
+**The no-UDP root cause (the rung's reported bug):**
+
+- Symptom: the SITL boots on device, arming flags never clear.
+- Kernel exonerated first: the loopback-UDP variant matrix
+  (`tools/godot_smoke/android/musend.c`, run in-app, `[musend]` lines in
+  fly.log) showed every leg delivering — bind 127.0.0.1:9002 and
+  0.0.0.0:9102, unbound/bound/connected `sendto` (n=1 each), connected
+  `send`, `recv` received the packet. The logged errno=2 is stale
+  residue (errno is never cleared on success).
+- Actual cause: the SITL's libc-shim sets (strconv/ctype
+  interpositions) exported GLOBAL dyn-syms, so on this link path their
+  definitions preempt bionic for calls inside the same ELF — the shim
+  `strtol`/ctype landed in the parse path of `inet_aton`, address parsing
+  broke, and none of the SITL's UDP legs (fdm 9003, rc 9004, servo 9002)
+  came up. No rc packet ever arrives, so `needRxSignalBefore` is never
+  pushed and arming stays blocked.
+- Fix: both shim sets build with hidden visibility (`STRTOL_EXPORT`/`LIGHT_EXPORT`
+  collapse to hidden); gate = no shim name among the packaged .so's
+  GLOBAL dyn-syms (`llvm-readelf --dyn-syms` on the unzipped APK lib).
+  With the fix the SITL binds, arms, and flies end-to-end on device.
+
+**Packaged vs staged sha (AGP artifact rule):**
+
+AGP strips debug symbols when it packages a jniLib, so the staged .so and
+the packaged .so differ: staged
+`84f95602e16c3494cf033525527a7a6d19094c268e66dd4c7d0de669192665b5`,
+packaged
+`1ddb70221a5ff9f3487460c502752169a66574c3218f4d0404a660ed163cc266` (v10
+pair run). The record embeds the PACKAGED sha, so the artifact check that
+matters is unzip-the-APK-vs-record — B2's on-device record embedded
+exactly the packaged sha above.
+
+**The mid-air disarm (the sealed v9 symptom, now captured):**
+
+- Seven device legs, five sim-s 5in-freestyle profile, seed 11, 16 sim s.
+  Peak column = record pz peak where the record was pulled (A/B/1/3/B2);
+  legs 2 and A2 were measured only by the pump's `max_alt` (leg 2's
+  record was not captured; A2's was overwritten by the next pull) — the
+  two agree whenever both exist, see below.
+
+  | leg | build        | verdict         | armed (record) | peak m  | servo_packets |
+  |-----|--------------|-----------------|---------------:|--------:|--------------:|
+  | A   | sealed v9a   | disarm          | 3.304          | 49.88   | 14100         |
+  | B   | sealed v9b   | disarm          | 1.792          | 53.95   |  6013         |
+  | 1   | instrumented | clean, 16 s     | 3.012          | 136.59  | 14023         |
+  | 2   | instrumented | clean, 16 s     | 3.008          | 136.61  | 11389         |
+  | 3   | instrumented | DISARM captured | 4.008          | 49.69   |  6022         |
+  | A2  | sealed v10   | clean           | 1.292 (pump)   | 88.26   |  9835         |
+  | B2  | sealed v10   | clean, 16 s     | 3.528          | 128.55  |  6661         |
+
+- Leg 3's direct capture (unbuffered stderr):
+  `[DARTER-DIAG] disarm reason=1 millis=50272 disableFlags=0x4`. In the
+  Betaflight tree (`src/main/fc/core.h`) reason 1 = DISARM_REASON_FAILSAFE;
+  in `src/main/fc/runtime_config.h` 0x4 = ARMING_DISABLED_RX_FAILSAFE, the
+  "rx recovered after a failsafe was raised" flavor — rc was lost, briefly
+  came back, then was lost again.
+- Mechanism: UDP RC starvation. Each received rc frame pushes
+  `needRxSignalBefore = now + 150 ms` (FC clock); 150 FC-sim ms of silence
+  raises RXLOSS; `failsafe_delay 15` (1.5 FC-sim s) stage 1; procedure
+  DROP_IT disarms with reason FAILSAFE.
+- Shared timing signature of the three disarm legs (record): motor cut at
+  armed+4.69 / +5.07 / +4.68 app-sim s, mid-climb 44-48 m at ~11 m/s, i0
+  4.65 -> 0.000 in one tick, then ballistic fall (vz 11.08 -> 0.43 over
+  the next ~70 ticks) to park. The pump stayed healthy through the cut
+  (servo counter climbing, throttle still at 0.2999).
+- Clocks diverge on slow legs: leg 3's FC-millis at disarm was 50272 ms
+  while the record's app-sim t was 8.688 s. The SITL's `micros64`
+  accumulates wall_delta x current simRate at every call; simRate is only
+  recomputed per arriving FDM packet (device rate ~0.58), so an app-side
+  stall charges the FC clock lump-wise at the stale rate and can run it
+  far ahead of both wall and the record clock. The RXLOSS and failsafe
+  timers run on the FC clock.
+- Stochastic, not instrumentation-caused: the same instrumented binary
+  flew clean twice then disarmed (3/7 legs, three builds; the disarm legs
+  are the slow legs). One correlation failed: `servo_packets` is a PACING
+  measure, not a class marker — B2 flew clean at 6661, inside the disarm
+  legs' 6013-6022 band. Classify by the reason print and trajectory.
+- Not verified: which side of the UDP pair starves (send-side pump stall,
+  receive-side scheduling, or the post-stall burst). A discriminator
+  exists if ever needed (the SITL's rx-lost flag is function-local; make
+  it file-scope and mid-flight transitions print). The shipped posture
+  treats a disarm-class leg as an honest Betaflight failsafe verdict —
+  re-run it; it says nothing about the fix, which the clean legs prove.
+
+**Altitude estimate agreement (a trap closed):**
+
+`max_alt` (the pump's running max of the FC's MSP ATTITUDE estimate) and
+the record's pz (darter's integrator) agree on every leg where both were
+captured — B2 exact to all digits (128.553343423827 in both), leg 1
+136.585 in both, sealed A 49.882 vs 49.876. An earlier divergence
+suspicion was a file mixup (one leg's estimate against a different leg's
+record), not a real effect. During ballistic falls the running max
+correctly freezes while pz continues down.
+
+**Radio at rest:** the EdgeTX Pocket stayed attached via OTG (kernel
+event12) through these runs and was silent at rest — no spurious axis or
+aux input. Its Android slot map differs from the desktop evdev map on
+slots 2/3/4; both tables are documented in `tools/gdext/src/lib.rs`
+(`pocket_input`). When the radio is attached during a probe flight it
+must not be touched: real stick moves override the injections.

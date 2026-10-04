@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://darter7flypa"]
+
+[ext_resource type="Script" path="res://fly_probe_android.gd" id="1"]
+
+[node name="FlyProbeAndroid" type="Node"]
+script = ExtResource("1")
