@@ -125,7 +125,11 @@ parity, because the firmware's PID loop runs on wall-clock time
 (`docs/physics.md` section 11). Its second flight (M2c) is the level hover
 with the sensor model on, flown with the SITL binary copied to a
 caller-chosen path — the relocation seam the on-device export will use —
-with the record header naming the copy as the binary that flew:
+with the record header naming the copy as the binary that flew. Its third
+flight (M2d) is the radio input path: a synthetic pilot plays the measured
+RadioMaster Pocket HID mapping through Godot's own Input pipeline, the
+same pipeline the physical radio feeds, and the record header gains the
+input source, `"input":"pocket_hid"`:
 
 ```
 cargo test --test godot_flyer -- --ignored --test-threads=1

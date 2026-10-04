@@ -457,6 +457,49 @@ estimate gates `tests/sitl_loop.rs` measures; the on-device form (the
 extracted executable Android's jniLibs places under nativeLibraryDir) is
 verified with the packaging rung, not here.
 
+The radio input path (M2d) adds an optional live-input source to the
+closed runner, consulted on the caller's thread every pumped tick:
+WaitGrace ignores it (grace-latch protection), WaitArmed reads only the
+aux channel, and the Fly phase feeds all sticks from it when present,
+falling back to the sim-time script when not. Godot-side, tools/gdext's
+`pocket_input` reads the RadioMaster Pocket's mapping straight out of Godot's
+Input singleton each tick and returns sticks plus aux3 in microseconds;
+src/sitl.rs's rc_packet then maps stick values clamp(±1) to 1500±500 us and
+throttle 0..1 to 1000+1000t, AETR order, as always. The hook reads device
+0 unconditionally, on two measured facts about Godot's input engine (gdext
+scratch rig, 2026-10-04): a synthetic JoypadMotion device's axis state
+persists in the axis table but a synthetic device never appears in
+get_connected_joypads, so pad-list gating would strand the padless CI
+probe on neutral forever; and a freshly connected physical pad starts at
+all axes 0.0 — Godot initializes nothing from hardware, real events only
+arrive on change. The Pocket's axis map itself is measured, not assumed
+(eight guided captures, 2026-10-04; the acceptance test's header documents
+it, the scratch rigs are not committed): raw HID report slots pass through
+Godot unremapped — the right stick is slots 0/1, the left stick's LR is
+slot 2, SA and SB are the 3-position switches on slots 3/5, the throttle
+is slot 4 with 0 at its bottom (clamped for the hook), SC and the SF trim
+dial are HID-silent, SD is button 1 and SE (the radio's only push button)
+is button 0; only slots 0-4 feed the RC path. The closed runs around that
+path measured the flight facts the pocket test pins: this preset's hover
+throttle is a razor edge at 0.16 (a probe at it never left the ground —
+max pz equal to the spawn height), 0.30 throttle climbs drag-limited at
+~11 m/s terminal, and a 0.4 aileron pulse under ANGLE tilts the hull to a
+peak |truth roll| of 11.40 deg in the burst window (armed+7.4..+8.7) and
+self-levels to 1.07 deg by armed+9.2. One unfixed interaction is
+documented, not patched: with the sensor model on, this same low-throttle
+ANGLE profile self-excites a saturated alternating-pair roll oscillation
+from ~5.6 s (observed once at 0.16 throttle; the sensors-off run at the
+identical stick schedule is smooth), which is why the pocket test runs
+SENSORS off — an isolation choice recorded on the test itself.
+
+That seam is desktop-form: Godot's Input pipeline on the workstation,
+driven synthetically through the pocket test with the physical radio
+attached but untouched (device id 0 is shared with the synthetic pilot;
+real axis events overwrite synthetic state only when a stick moves). The
+on-device form — the Pocket over USB OTG from an Android phone — is the
+next rung of the path; SB/SD/SE and the SA disarm (arm-down) direction are
+untested.
+
 ## 12. Calibration status
 
 Policy (`tests/calibration.rs`): the held-out anchor. `ct0` is fit from the

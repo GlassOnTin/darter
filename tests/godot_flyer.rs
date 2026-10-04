@@ -1,4 +1,5 @@
-//! M2 rung 2 — the closed-flyer class: real-firmware flight driven from Godot.
+//! M2 closed-flyer rungs — the closed-flyer class: real-firmware flight
+//! driven from Godot.
 //!
 //! sim_run --mode closed wraps a whole runner behind a CLI: spawn the
 //! Betaflight SITL child in a fresh cwd, apply the profile over the MSPv2
@@ -14,7 +15,11 @@
 //! mirror sitl_loop's measured-yaw test exactly, driven instead through the
 //! class API from fly_probe.gd, plus the record-header contract (mode
 //! "closed", the applied profile lines, SITL provenance with a Betaflight
-//! version string).
+//! version string). Three tests, one per rung: closed yaw through the
+//! class API (M2b), the same flight with the SITL binary relocated/reused
+//! (M2c), and the radio input path — a synthetic pilot flying Godot's own
+//! Input pipeline through the measured RadioMaster Pocket HID mapping
+//! (M2d, documented on the pocket test below).
 //!
 //! Recipe (dev machine; NOT in CI — it spawns a real SITL child on fixed
 //! ports TCP 5761 / UDP 9002-9004, which needs the Betaflight SITL binary
@@ -28,8 +33,15 @@
 //! Not verified here: the live per-rendered-frame API (pacing under a real
 //! display driver; this suite is headless and wall-paced only), terrain/
 //! wind configs through the class (sim_run covers those), the Android
-//! arm64 .so, and the on-device form of the M2c seam (nativeLibraryDir
-//! extraction of the shipped SITL binary).
+//! arm64 .so, the on-device form of the M2c seam (nativeLibraryDir
+//! extraction of the shipped SITL binary), and the M2d Pocket over a real
+//! USB HID transport on the phone — this suite's pilot is synthetic axis
+//! events through the same Input pipeline; the measured HID map lives in
+//! the captures behind docs/physics.md section 11, SB/SD/SE and the
+//! disarm direction are untested, and the desktop runs ran with the
+//! physical radio attached but untouched (device id 0 is shared with the
+//! synthetic pilot; real axis events overwrite it only when a stick
+//! moves).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -197,6 +209,9 @@ fn run_probe(name: &str, extra: &[(&str, String)]) -> PathBuf {
 /// runner writes). Only rows carrying FC telemetry are loaded.
 struct Row {
     t: f64,
+    /// Sim height (m) — the M2d test's lift assert (did the throttle axis
+    /// actually raise the quad?).
+    pz: f64,
     qw: f64,
     qx: f64,
     qy: f64,
@@ -237,6 +252,7 @@ fn load_record(out_dir: &Path) -> (String, Vec<Row>) {
         .filter(|l| l.starts_with("{\"t\"") && l.contains("\"att_r\""))
         .map(|l| Row {
             t: fnum(l, "t"),
+            pz: fnum(l, "pz"),
             qw: fnum(l, "qw"),
             qx: fnum(l, "qx"),
             qy: fnum(l, "qy"),
@@ -505,5 +521,230 @@ fn godot_flyer_closed_hover_with_relocated_sitl() {
     assert!(
         rx <= 3.5 && px <= 3.5,
         "estimate max beyond 3.5 deg: roll {rx:.2}, pitch {px:.2}"
+    );
+}
+
+/// M2d rung: radio input, desktop in-sim form — the RadioMaster Pocket
+/// over USB HID drives the flight. The mapping below is measured, from
+/// guided captures against the physical radio (2026-10-04, eight rounds;
+/// scratch logs kept under /tmp, not committed). Axis slots are
+/// Input.get_joy_axis indexes — what the gdext hook reads — NOT SDL
+/// semantic axis names:
+///
+///   axis 0  right-stick LR   -1 left .. +1 right   (aileron -> roll)
+///   axis 1  right-stick UD   +1 = stick away       (elevator -> pitch)
+///   axis 2  left-stick  LR   -1 left .. +1 right   (rudder -> yaw)
+///   axis 3  SA switch        -1 / 0 / +1; +1 = arm end  (-> aux3 2000 us)
+///   axis 4  throttle         0 at bottom .. +1 at top
+///   axis 5  SB switch        -1 / 0 / +1
+///
+/// SC (3-pos) and the SF trim dial are HID-silent (no axis or button event
+/// in any capture round); SD = button 1; SE, the radio's only push button,
+/// = button 0. The throttle's 0..+1 range is what the hook clamps on.
+///
+/// The test cannot attach the radio, so the probe plays a synthetic pilot
+/// through Godot's REAL Input pipeline (InputEventJoypadMotion on device
+/// 0, flushed) — the same pipeline the physical radio feeds. Synthetic
+/// axis state persists in Godot's axis table, but a synthetic device never
+/// appears in get_connected_joypads (measured with a device-5 probe:
+/// joycount stayed at the physical pads), which is why the hook reads
+/// device-0 axis state directly — a pad-list gate would land this test
+/// neutral forever on a padless CI box. Schedule: SA +1 from t=0.5,
+/// throttle ramp to 0.30 over 0.5 s once armed, aileron burst +0.4 over
+/// armed+7.5..+8.0.
+///
+/// Measured in-air with SENSORS off (seed 11, 16 s, armed 4.736 s — the
+/// run the gates below were pinned from): throttle 0.30 climbs
+/// drag-limited at ~11 m/s terminal (max pz 109.30 m over spawn 0.50 —
+/// not a hover flight, only its first seconds matter); the settled
+/// att-vs-truth window armed+2..+7 reads |err| mean and max 0.00 deg on
+/// both axes (deterministic — sensors off); aileron 0.4 tilts to peak
+/// |truth roll| 11.40 deg and the released ANGLE loop pulls it to 1.07
+/// deg by a0+9.2. The att-vs-truth window sits BEFORE the burst so the
+/// hover gate stays a hover gate. Throttle 0.16 (the earlier pilot value)
+/// sits exactly at this preset's lift-off threshold — a scratch probe at
+/// it never left the ground (max pz = spawn height, 0.4999 m), a razor
+/// edge no test may sit on; 0.30 clears it with margin.
+///
+/// SENSORS off is an isolation choice, not a claim: with the sensors on,
+/// this same profile self-excites a saturated alternating-pair roll
+/// oscillation from ~5.6 s (observed once at 0.16 throttle, record kept
+/// in /tmp scratch; M2c's own sensors-on run was ACRO and stable). The
+/// input path and the sensor path are gated separately by design, and
+/// that interaction is documented in docs/physics.md section 11.
+#[test]
+#[ignore = "needs tools/godot/bin/godot (pinned 4.7.2-stable), a built tools/gdext extension, and the Betaflight SITL binary; run: cargo test --test godot_flyer -- --ignored --test-threads=1"]
+fn godot_flyer_closed_flight_via_pocket_radio() {
+    if !port_free_or_skip() {
+        eprintln!("port 5761 busy — skipping");
+        return;
+    }
+    let dir = run_probe(
+        "pocket",
+        &[
+            ("DARTER_FLYER_SEED", "11".into()),
+            // 16 s: arming measured 4.7-4.8 s, settled window +2..+7,
+            // burst +7.5..+8, and ~2.9 s of recovery inside the record.
+            ("DARTER_FLYER_DURATION", "16".into()),
+            // Sensors off, isolating the input path under test: with them
+            // on, this profile self-excites the roll oscillation documented
+            // in the header (the input and sensor paths are gated
+            // separately — docs/physics.md section 11).
+            ("DARTER_FLYER_SENSORS", "0".into()),
+            ("DARTER_FLYER_RADIO", "pocket".into()),
+            (
+                "DARTER_FLYER_PROFILE",
+                "aux 0 0 2 1700 2100 0 0;aux 1 1 2 1700 2100 0 0".into(),
+            ),
+        ],
+    );
+    let (header, rows) = load_record(&dir);
+
+    // The header contract gains the input-source field: the record says
+    // which input drove the flight.
+    assert!(
+        header.contains("\"mode\":\"closed\""),
+        "header mode not closed: {header}"
+    );
+    assert!(
+        header.contains("\"profile\":[\"aux 0 0 2 1700 2100 0 0"),
+        "arm profile not applied (header): {header}"
+    );
+    assert!(
+        header.contains("aux 1 1 2 1700 2100 0 0"),
+        "angle-mode line missing from applied profile (header): {header}"
+    );
+    assert!(
+        header.contains("\"sensors\":null"),
+        "sensor model not disabled (header): {header}"
+    );
+    assert!(
+        header.contains("\"input\":\"pocket_hid\""),
+        "header input source not pocket_hid (schema v5 field): {header}"
+    );
+    assert!(
+        header.contains("Betaflight /"),
+        "sitl version missing (header): {header}"
+    );
+
+    // The whole arming comes through the input hook now: SA's +1 end maps
+    // to aux3 2000 us, within the profile's 1700-2100 arm range. There is
+    // no scripted ARMED_US fallback when the input source is set — if the
+    // hook or the mapping were broken, the arm timeout fires and this is
+    // empty.
+    let armed = armed_rows(&rows);
+    assert!(
+        !armed.is_empty(),
+        "never armed through the pocket input path — record in {dir:?}"
+    );
+
+    // The throttle axis lifted the hull, measured against the spawn
+    // height (first-sample pz) — an absolute floor alone would pass a
+    // quad that never left the ground: the 0.16-throttle scratch sat at
+    // max pz 0.4999 = spawn 0.5 and cleared a 0.3 floor. In-air measured:
+    // 109.30 m over the 16 s run at 0.30 throttle.
+    let spawn_pz = rows[0].pz;
+    let lift_max = rows.iter().map(|r| r.pz).fold(0.0f64, f64::max);
+    println!(
+        "flyer pocket: armed at {:.3} s, max pz {lift_max:.3} m (spawn {spawn_pz:.3})",
+        armed[0].t
+    );
+    assert!(
+        lift_max - spawn_pz >= 0.3,
+        "throttle axis never lifted the hull: max pz {lift_max:.3} vs spawn {spawn_pz:.3} m"
+    );
+
+    // Quiet window: att-vs-truth gates identical to M2c's hover window,
+    // placed before the burst so the burst and its recovery stay out of
+    // the hover gate. In-air measured (sensors off): |err| mean and max
+    // 0.00 deg on both axes.
+    let a0 = armed[0].t;
+    let window: Vec<&Row> = armed
+        .iter()
+        .copied()
+        .filter(|r| a0 + 2.0 <= r.t && r.t <= a0 + 7.0)
+        .collect();
+    assert!(
+        window.len() > 50,
+        "hover window too thin: {} rows",
+        window.len()
+    );
+    let truth = |r: &Row| -> (f64, f64) {
+        let roll = (2.0 * (r.qw * r.qx + r.qy * r.qz))
+            .atan2(1.0 - 2.0 * (r.qx * r.qx + r.qy * r.qy))
+            .to_degrees();
+        let sinp = (2.0 * (r.qw * r.qy - r.qz * r.qx)).clamp(-1.0, 1.0);
+        (roll, sinp.asin().to_degrees())
+    };
+    let mut errs_r = Vec::with_capacity(window.len());
+    let mut errs_p = Vec::with_capacity(window.len());
+    for r in &window {
+        let (roll, pitch) = truth(r);
+        errs_r.push(wrap180(r.att_r_deg - roll));
+        errs_p.push(wrap180(r.att_p_deg - pitch));
+    }
+    let stat = |v: &[f64]| -> (f64, f64) {
+        let mean = v.iter().map(|e| e.abs()).sum::<f64>() / v.len() as f64;
+        let max = v.iter().fold(0.0f64, |m, e| m.max(e.abs()));
+        (mean, max)
+    };
+    let (rm, rx) = stat(&errs_r);
+    let (pm, px) = stat(&errs_p);
+    println!(
+        "flyer pocket hover: roll |err| mean {rm:.2} |max| {rx:.2} deg; \
+         pitch |err| mean {pm:.2} |max| {px:.2} deg (n={})",
+        window.len()
+    );
+    assert!(
+        rm <= 2.0 && pm <= 2.0,
+        "estimate mean beyond 2 deg: roll {rm:.2}, pitch {pm:.2}"
+    );
+    assert!(
+        rx <= 3.5 && px <= 3.5,
+        "estimate max beyond 3.5 deg: roll {rx:.2}, pitch {px:.2}"
+    );
+
+    // The burst: aileron 0.4 for 0.5 s tilts to a BOUNDED angle (ANGLE
+    // mode engaged — an acro response would keep rotating past the assert)
+    // and, released, recovers most of it. In-air measured: peak 11.40 deg,
+    // +roll direction (qx positive, matching +1 = right stick).
+    let burst: Vec<&Row> = rows
+        .iter()
+        .filter(|r| a0 + 7.4 <= r.t && r.t <= a0 + 8.7)
+        .collect();
+    assert!(
+        burst.len() > 20,
+        "burst window too thin: {} rows",
+        burst.len()
+    );
+    // Max |truth roll| inside the burst window (release decay included);
+    // the settled window's own tilt is tiny by comparison.
+    let peak_r = burst.iter().map(|r| truth(r).0.abs()).fold(0.0f64, f64::max);
+    println!("flyer pocket burst: max |truth roll| {peak_r:.2} deg");
+    assert!(
+        peak_r >= 6.0,
+        "aileron burst produced no measurable tilt: max |truth roll| {peak_r:.2} deg"
+    );
+    assert!(
+        peak_r <= 30.0,
+        "tilt unbounded — ANGLE mode likely not engaged: max |truth roll| {peak_r:.2} deg"
+    );
+    // Recovery: the released ANGLE loop pulls the tilt back — measured
+    // 11.40 -> 1.07 deg by a0+9.2. Assert the recovered tilt stays under
+    // 70% of the peak, not level-zero: a fixed-instant zero would be
+    // another razor edge.
+    let late: Vec<&Row> = rows
+        .iter()
+        .filter(|r| a0 + 8.7 <= r.t && r.t <= a0 + 9.2)
+        .collect();
+    assert!(!late.is_empty(), "no rows in the recovery window");
+    let rec = late
+        .iter()
+        .map(|r| truth(r).0.abs())
+        .fold(0.0f64, f64::max);
+    println!("flyer pocket recovery: max |truth roll| {rec:.2} deg by a0+9.2");
+    assert!(
+        rec <= peak_r * 0.7,
+        "burst tilt not recovered: peak {peak_r:.2} deg, still {rec:.2} deg at a0+9.2"
     );
 }

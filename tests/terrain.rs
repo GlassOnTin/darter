@@ -576,7 +576,10 @@ fn sim_run_ramp_flight_lands_on_the_ramp() {
     assert!(peak < 50.26, "no bounce above spawn: {peak}");
 
     let summary = std::fs::read_to_string(dir.join("summary.json")).unwrap();
-    const PINNED_RAMP_HASH: &str = "f5bf940927db2705";
+    // Regenerated for schema v5 (the header gained the closed-mode
+    // "input" source field; the bytes otherwise unchanged for this
+    // record — 2026-10-04, M2d rung).
+    const PINNED_RAMP_HASH: &str = "66a5d9e7f6429023";
     assert_eq!(
         record_hash(&summary),
         PINNED_RAMP_HASH,

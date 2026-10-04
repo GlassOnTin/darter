@@ -9,11 +9,13 @@
 //!
 //! Line schemas (field order is the wire contract; appending fields is a
 //! version bump, reordering is a new schema):
-//!   header: {"schema":"darter_record","version":4,"mode":..,"seed":..,
+//!   header: {"schema":"darter_record","version":5,"mode":..,"seed":..,
 //!            "duration_s":..,"preset":..,"profile":[..],
-//!            "sensors":{..}|null,"wind":{..}|null,"sitl":{..}|null}
+//!            "sensors":{..}|null,"wind":{..}|null,"sitl":{..}|null,
+//!            "input":string|null}
 //!     (v2 added sensors provenance, v3 added the g*/alt/vario FC fields,
-//!      v4 added the wind config + per-sample wind fields)
+//!      v4 added the wind config + per-sample wind fields, v5 added the
+//!      input-source provenance)
 //!   sample: {"t":..,"px":..,"py":..,"pz":..,"vx":..,"vy":..,"vz":..,
 //!            "qw":..,"qx":..,"qy":..,"qz":..,"wx":..,"wy":..,"wz":..,
 //!            "r0":..,"r1":..,"r2":..,"r3":..,"i0":..,"i1":..,"i2":..,"i3":..,
@@ -41,7 +43,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 pub const SCHEMA_NAME: &str = "darter_record";
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// FNV-1a 64-bit (offset 14695981039346656037, prime 1099511628211).
 pub fn fnv1a64(data: &[u8], mut hash: u64) -> u64 {
@@ -71,6 +73,9 @@ pub struct RecordHeader {
     pub sensors: Option<crate::sensor::SensorConfig>,
     /// Wind model provenance (None = still air, Quad::wind stays zero).
     pub wind: Option<crate::wind::WindConfig>,
+    /// Live input-source name (None = the sim-time stick script; the closed
+    /// runner's default). Written "field":null when absent, like sensors.
+    pub input: Option<&'static str>,
 }
 
 /// One sampled tick. FC telemetry is optional (None in core-only runs and
@@ -181,6 +186,11 @@ impl RecordWriter {
             }
             None => s.push_str(",\"sitl\":null"),
         }
+        match h.input {
+            // json_str emits the quoted form itself (as sitl's fields above).
+            Some(name) => s.push_str(&format!(",\"input\":{}", json_str(name))),
+            None => s.push_str(",\"input\":null"),
+        }
         s.push('}');
         self.write_line(&s)
     }
@@ -277,6 +287,7 @@ mod tests {
             sitl: None,
             sensors: None,
             wind: None,
+            input: None,
         })
         .unwrap();
         w.write_sample(&sample(0.0, 0.5)).unwrap();
@@ -286,7 +297,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
         let header = lines.next().unwrap();
-        assert!(header.starts_with("{\"schema\":\"darter_record\",\"version\":4,\"mode\":\"core\",\"seed\":7,\"duration_s\":2.000,\"preset\":\"FREESTYLE_5IN\",\"profile\":[\"aux 0 0 2 1700 2100 0 0\"],\"sensors\":null,\"wind\":null,\"sitl\":null}"));
+        assert!(header.starts_with("{\"schema\":\"darter_record\",\"version\":5,\"mode\":\"core\",\"seed\":7,\"duration_s\":2.000,\"preset\":\"FREESTYLE_5IN\",\"profile\":[\"aux 0 0 2 1700 2100 0 0\"],\"sensors\":null,\"wind\":null,\"sitl\":null,\"input\":null}"));
         let s0 = lines.next().unwrap();
         assert!(
             s0.starts_with("{\"t\":0.000,\"px\":1.000000,\"py\":2.000000,\"pz\":0.500000,"),
@@ -309,6 +320,7 @@ mod tests {
                 w20_ms: 15.43,
                 seed: 9,
             }),
+            input: None,
         })
         .unwrap();
         let mut sw = sample(0.0, 0.5);
@@ -335,6 +347,7 @@ mod tests {
                 sitl: None,
                 sensors: None,
                 wind: None,
+                input: None,
             })
             .unwrap();
             w.write_sample(&sample(0.0, 0.5)).unwrap();

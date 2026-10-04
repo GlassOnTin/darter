@@ -494,8 +494,9 @@ fn run_closed(args: &Args, terrain: Option<&TerrainGrid>) -> Result<RunOutcome, 
         sensor_cfg: args.sensor_cfg.clone(),
         wind_cfg: args.wind_cfg,
         terrain: terrain.cloned(),
+        input: None,
     };
-    let mut flyer = Flyer::start(&cfg, &out_dir, "flight.jsonl")?;
+    let mut flyer = Flyer::start(cfg, &out_dir, "flight.jsonl")?;
     flyer.pump((duration / TICK_DT).floor() as usize)?;
     let st = flyer.finish()?;
     Ok(RunOutcome {

@@ -124,6 +124,7 @@ impl CoreFlight {
                 sitl: None,
                 sensors: None,
                 wind: setup.wind_cfg,
+                input: None,
             })
             .map_err(|e| format!("record header: {e}"))?;
 

@@ -96,6 +96,33 @@ pub struct SitlFacts {
     pub profile_readback_ok: bool,
 }
 
+/// One sample from a live input source: the radio's state mapped into RC,
+/// as the closed runner needs it. Roll/pitch/yaw in -1..1 with 0 centered;
+/// throttle in 0..1 with 0 at the bottom (the Pocket's measured throttle
+/// range, not the usual -1..1 joystick span); aux3 in microseconds (1000 =
+/// box down, 2000 = up; the default profile arms 1700..2100).
+pub struct LiveInput {
+    pub roll: f64,
+    pub pitch: f64,
+    pub yaw: f64,
+    pub throttle: f64,
+    pub aux3_us: u16,
+}
+
+/// A named live input source (M2d: the gdext hook reading the radio's
+/// joypad axes). The closure runs once per pumped tick ON THE CALLER'S
+/// THREAD — the gdext side reads Godot's Input singleton there, which is
+/// legal on the GDScript main thread — and replaces the stick script in
+/// WaitArmed and Fly. WaitGrace is NOT consulted: it keeps sending
+/// DISARMED_US until FC grace clears, absorbing any pre-grace arm flips.
+/// No joypad attached = neutral zeros with the box down, so a radioless
+/// run never arms and fails the arm timeout with its plain error.
+pub struct LiveInputSource {
+    /// Written into the record header ("input":"...").
+    pub name: &'static str,
+    pub provide: Box<dyn FnMut() -> LiveInput + Send>,
+}
+
 /// Everything a closed flight needs before it starts. Sim-time stick scripts
 /// (`yaw` until `yaw_until`, etc.) drive the Fly phase; `*_until =
 /// f64::INFINITY` means "stick held for the whole flight".
@@ -122,6 +149,9 @@ pub struct FlyerConfig {
     /// DEM sidecar (already parsed): spawn half a metre above the height at
     /// the origin and follow the grid for ground contact. None = flat at 0.
     pub terrain: Option<TerrainGrid>,
+    /// Live input source (M2d radio path); its name goes in the record
+    /// header. None = the sim-time stick script above (default).
+    pub input: Option<LiveInputSource>,
 }
 
 impl FlyerConfig {
@@ -144,6 +174,7 @@ impl FlyerConfig {
             sensor_cfg: None,
             wind_cfg: None,
             terrain: None,
+            input: None,
         }
     }
 }
@@ -367,6 +398,7 @@ pub struct Flyer {
     phase: ArmPhase,
     phase_entered: f64,
     armed_at: Option<f64>,
+    input: Option<LiveInputSource>,
 }
 
 impl Flyer {
@@ -374,7 +406,7 @@ impl Flyer {
     /// links. The quad spawns half a metre above the DEM height at the origin
     /// (flat ground without a grid); ground contact follows the grid from the
     /// first substep when a grid is set.
-    pub fn start(cfg: &FlyerConfig, out_dir: &Path, record_name: &str) -> Result<Flyer, String> {
+    pub fn start(cfg: FlyerConfig, out_dir: &Path, record_name: &str) -> Result<Flyer, String> {
         std::fs::create_dir_all(out_dir).map_err(|e| format!("out dir: {e}"))?;
 
         // Provenance: hash of the binary that will run.
@@ -479,6 +511,7 @@ impl Flyer {
                 }),
                 sensors: cfg.sensor_cfg.clone(),
                 wind: cfg.wind_cfg,
+                input: cfg.input.as_ref().map(|s| s.name),
             })
             .map_err(|e| format!("record header: {e}"))?;
 
@@ -536,6 +569,7 @@ impl Flyer {
             phase: ArmPhase::WaitGrace,
             phase_entered: 0.0,
             armed_at: None,
+            input: cfg.input,
         })
     }
 
@@ -557,11 +591,18 @@ impl Flyer {
                 self.quad.wind = w.step(TICK_DT, self.quad.state.pos.z);
             }
 
-            // Latest FC status drives the arming state machine.
+            // Latest FC status drives the arming state machine. The live
+            // input source (when set) replaces the stick script in
+            // WaitArmed (box value only) and Fly (all channels); WaitGrace
+            // ignores it — grace always holds the box down.
             let (arm, flags) = {
                 let st = self.telem.lock().unwrap();
                 st.status.last().map(|s| (s.1, s.2)).unwrap_or((u32::MAX, 0))
             };
+            let live = self
+                .input
+                .as_mut()
+                .map(|src| (src.provide)());
             let (thr, aux3, yaw, pitch, roll, next_phase) = match self.phase {
                 ArmPhase::WaitGrace => {
                     if t - self.phase_entered > GRACE_TIMEOUT_S {
@@ -581,26 +622,30 @@ impl Flyer {
                             "did not arm: arming_disable={arm:#x} flight_flags={flags:#x} at t={t:.1}"
                         ));
                     }
+                    let aux3 = live.as_ref().map_or(ARMED_US, |li| li.aux3_us);
                     if arm == 0 && flags & 1 != 0 {
-                        (0.0, ARMED_US, 0.0, 0.0, 0.0, Some(ArmPhase::Fly))
+                        (0.0, aux3, 0.0, 0.0, 0.0, Some(ArmPhase::Fly))
                     } else {
-                        (0.0, ARMED_US, 0.0, 0.0, 0.0, None)
+                        (0.0, aux3, 0.0, 0.0, 0.0, None)
                     }
                 }
-                ArmPhase::Fly => {
-                    let dt = t - self.armed_at.unwrap_or(0.0);
-                    let thr = if dt < SETTLE_S {
-                        0.0
-                    } else if dt < SETTLE_S + RAMP_S {
-                        self.cfg_throttle * (dt - SETTLE_S) / RAMP_S
-                    } else {
-                        self.cfg_throttle
-                    };
-                    let yaw = if t < self.cfg_yaw_until { self.cfg_yaw } else { 0.0 };
-                    let pitch = if t < self.cfg_pitch_until { self.cfg_pitch } else { 0.0 };
-                    let roll = if t < self.cfg_roll_until { self.cfg_roll } else { 0.0 };
-                    (thr, ARMED_US, yaw, pitch, roll, None)
-                }
+                ArmPhase::Fly => match live {
+                    Some(li) => (li.throttle, li.aux3_us, li.yaw, li.pitch, li.roll, None),
+                    None => {
+                        let dt = t - self.armed_at.unwrap_or(0.0);
+                        let thr = if dt < SETTLE_S {
+                            0.0
+                        } else if dt < SETTLE_S + RAMP_S {
+                            self.cfg_throttle * (dt - SETTLE_S) / RAMP_S
+                        } else {
+                            self.cfg_throttle
+                        };
+                        let yaw = if t < self.cfg_yaw_until { self.cfg_yaw } else { 0.0 };
+                        let pitch = if t < self.cfg_pitch_until { self.cfg_pitch } else { 0.0 };
+                        let roll = if t < self.cfg_roll_until { self.cfg_roll } else { 0.0 };
+                        (thr, ARMED_US, yaw, pitch, roll, None)
+                    }
+                },
             };
             if let Some(next) = next_phase {
                 if next == ArmPhase::Fly {

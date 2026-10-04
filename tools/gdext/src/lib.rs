@@ -21,11 +21,12 @@
 //! probe scene treats those as a failure.
 
 use darter_core::flight::{CoreFlight, CoreSetup, TICK_DT};
-use darter_core::flyer::{Flyer, FlyerConfig};
+use darter_core::flyer::{Flyer, FlyerConfig, LiveInput, LiveInputSource};
 use darter_core::preset::Preset;
 use darter_core::sensor::SensorConfig;
 use darter_core::terrain::TerrainGrid;
 use darter_core::DVec3;
+use godot::global::JoyAxis;
 use godot::prelude::*;
 
 /// The extension entry struct (gdext wants a named unit type; the class
@@ -250,6 +251,10 @@ struct DarterFlyer {
     /// DarterQuad's `setup`/`set_throttle` use, minus the per-flight clear —
     /// a persistent instance keeps its configured inputs across flights.
     sensors_pending: Option<SensorConfig>,
+    /// Likewise sticky: `flyer_set_radio_pocket(true)` wires the next (and
+    /// every) `flyer_start` to read the radio's joypad axes from Godot's
+    /// Input singleton — the M2d RadioMaster Pocket HID path.
+    radio_pocket: bool,
 }
 
 #[godot_api]
@@ -258,6 +263,7 @@ impl IRefCounted for DarterFlyer {
         Self {
             flyer: None,
             sensors_pending: None,
+            radio_pocket: false,
         }
     }
 }
@@ -314,7 +320,13 @@ impl DarterFlyer {
             s.seed = seed;
             cfg.sensor_cfg = Some(s);
         }
-        match Flyer::start(&cfg, std::path::Path::new(&work), "flight.jsonl") {
+        if self.radio_pocket {
+            cfg.input = Some(LiveInputSource {
+                name: "pocket_hid",
+                provide: Box::new(|| pocket_input()),
+            });
+        }
+        match Flyer::start(cfg, std::path::Path::new(&work), "flight.jsonl") {
             Ok(f) => {
                 self.flyer = Some(f);
                 String::new()
@@ -333,6 +345,17 @@ impl DarterFlyer {
     #[func]
     fn flyer_set_sensors(&mut self, enabled: bool) {
         self.sensors_pending = if enabled { Some(SensorConfig::DEFAULT) } else { None };
+    }
+
+    /// Route (or unroute) `flyer_start`'s stick input through the
+    /// RadioMaster Pocket HID mapping (M2d): each pumped tick, the runner
+    /// consults a hook that reads Godot's Input singleton's device-0 axis
+    /// state — the same table the physical radio feeds — instead of the
+    /// sim-time stick script. Sticky across flights, like
+    /// `flyer_set_sensors`.
+    #[func]
+    fn flyer_set_radio_pocket(&mut self, enabled: bool) {
+        self.radio_pocket = enabled;
     }
 
     /// Advance at most `n` more 250 Hz ticks (no-op past the plan). Returns
@@ -425,4 +448,49 @@ impl DarterFlyer {
 
 fn to_godot_packed(v: &[f64]) -> PackedFloat32Array {
     PackedFloat32Array::from(v.iter().map(|x| *x as f32).collect::<Vec<f32>>())
+}
+
+/// One tick of the RadioMaster Pocket HID mapping, read live from Godot's
+/// Input singleton. Measured against the physical radio over USB (guided
+/// captures, 2026-10-04, eight rounds; scratch logs not committed). The
+/// axis slots below are Input.get_joy_axis indexes for this device — Godot
+/// passes raw HID report slots through unremapped, so they are NOT the
+/// standard controller semantics (the right stick is slots 0/1, the left
+/// stick LR is slot 2; there is no LEFT_Y on this device):
+///
+///   slot 0  right-stick LR   -1 left .. +1 right   (aileron -> roll)
+///   slot 1  right-stick UD   +1 = stick away       (elevator -> pitch)
+///   slot 2  left-stick  LR   -1 left .. +1 right   (rudder -> yaw)
+///   slot 3  SA switch        -1 / 0 / +1; +1 = arm end (-> aux3 2000 us)
+///   slot 4  throttle         0 at bottom .. +1 at top
+///   slot 5  SB switch        -1 / 0 / +1
+///
+/// SC (3-pos) and the SF trim dial are HID-silent; SD = button 1; SE, the
+/// only push button, = button 0 — none of these feed the RC path. The
+/// same facts are in tests/godot_flyer.rs's pocket test (the mapping's
+/// acceptance test) and docs/physics.md section 11.
+fn pocket_input() -> LiveInput {
+    let input = godot::classes::Input::singleton();
+    // Device 0, read unconditionally — NOT gated on get_connected_joypads.
+    // Measured (gdext scratch rig, 2026-10-04): synthetic JoypadMotion axis
+    // state persists in Godot's axis table, but a synthetic device NEVER
+    // appears in the connected-pads list, so a pad-list gate would make the
+    // padless CI probe read neutral forever. With no events injected the
+    // table reads 0.0, so a radioless phone still lands in the plain arm
+    // timeout (SA never reaches +1) — the single-Pocket assumption is
+    // device 0; naming/enumeration of other pads is a later rung.
+    let slot =
+        |n: i64| -> JoyAxis { JoyAxis::try_from_ord(n as i32).unwrap_or(JoyAxis::INVALID) };
+    let ax = |n: i64| -> f64 { input.get_joy_axis(0, slot(n)) as f64 };
+    let sa = ax(3); // -1 / 0 / +1; the +1 end is arm
+    let aux3_us = (1500.0_f64 + sa * 500.0).clamp(1000.0, 2000.0) as u16;
+    LiveInput {
+        roll: ax(0),
+        pitch: ax(1),
+        yaw: ax(2),
+        // Measured range: slot 4 sits at 0 at the throttle's bottom, +1 at
+        // the top — not the +-1 span the sticks swing.
+        throttle: ax(4).clamp(0.0, 1.0),
+        aux3_us,
+    }
 }
